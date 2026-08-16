@@ -1,0 +1,8 @@
+# 界面框架（必需）
+PySide6>=6.5
+
+# 可选：装上后用更高效的进程检测；不装会自动回退到 PowerShell/tasklist
+psutil>=5.9
+
+# 仅打包 exe 时需要（见 README「打包成免安装 exe」）
+# pyinstaller>=6.0
