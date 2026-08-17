@@ -22,6 +22,15 @@ rem ---- verify build dependencies ----
 where python >nul 2>&1 || (echo [ERROR] python not found. Install Python and add it to PATH. & goto :err)
 python -c "import PySide6" >nul 2>&1 || (echo [ERROR] PySide6 not found. Run: pip install PySide6 & goto :err)
 python -c "import PyInstaller" >nul 2>&1 || (echo [ERROR] PyInstaller not found. Run: pip install pyinstaller & goto :err)
+if not exist "%~dp0face_detection_yunet_2023mar.onnx" (
+    echo [WARN] face_detection_yunet_2023mar.onnx not found.
+    echo        Camera presence detection will be degraded in the built exe.
+    echo        Download: https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx
+)
+if not exist "%~dp0person_det.onnx" (
+    echo [WARN] person_det.onnx YOLOv8n person detector not found.
+    echo        Bowed-head / back-to-camera presence detection will be disabled.
+)
 
 echo [1/2] Generating icon.ico ...
 python make_icon.py || goto :err
@@ -30,6 +39,8 @@ echo [2/2] Building with PyInstaller (onedir + windowed) ...
 python -m PyInstaller --noconfirm --clean --onedir --windowed ^
   --name PomodoroGuard ^
   --icon icon.ico ^
+  --add-data "face_detection_yunet_2023mar.onnx;." ^
+  --add-data "person_det.onnx;." ^
   --exclude-module PySide6.QtQml ^
   --exclude-module PySide6.QtQuick ^
   --exclude-module PySide6.QtWebEngineCore ^

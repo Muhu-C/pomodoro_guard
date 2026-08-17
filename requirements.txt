@@ -4,5 +4,12 @@ PySide6>=6.5
 # 可选：装上后用更高效的进程检测；不装会自动回退到 PowerShell/tasklist
 psutil>=5.9
 
+# 摄像头在场检测（离开自动暂停/休息无人关遮罩）：
+# 不装时该功能整体降级为不可用，其余功能不受影响；
+# 模型文件 face_detection_yunet_2023mar.onnx（人脸）
+# 与 person_det.onnx（人体/YOLOv8n）需随程序分发，缺失其一则只用另一个
+opencv-python-headless>=4.8
+numpy>=1.24
+
 # 仅打包 exe 时需要（见 README「打包成免安装 exe」）
 # pyinstaller>=6.0
