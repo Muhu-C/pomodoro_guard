@@ -2,7 +2,7 @@
 
 
 a = Analysis(
-    ['pomodoro_guard.py'],
+    ['main.py'],
     pathex=[],
     binaries=[],
     datas=[('face_detection_yunet_2023mar.onnx', '.'), ('person_det.onnx', '.')],

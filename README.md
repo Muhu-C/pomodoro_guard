@@ -15,11 +15,23 @@
 
 ```
 pomodoro_guard/
-├── pomodoro_core.py     # 核心逻辑（UI 无关）：进程检测/关闭、番茄钟状态机、配置、解码
-├── presence.py          # 核心逻辑（UI 无关）：摄像头人像在场检测（人脸+人体组合，后台线程）
-├── stats.py             # 核心逻辑（UI 无关）：专注时长统计（SQLite：段记录/日周月聚合/streak）
-├── window_minimize.py   # 核心逻辑（UI 无关）：工作时段最小化应用（按进程名枚举可见窗口并最小化）
-├── pomodoro_guard.py    # PySide6 界面层（展开模式为 设置·监管（可滚动） / 统计 两页导航）
+├── main.py              # 入口：实例化所有模块、依赖注入与组装
+├── controller.py        # 总控制器：业务规则枢纽（GUI 每次操作一行调用）
+├── core/                # 核心逻辑层（UI 无关，可单独测试）
+│   ├── engine.py        # 番茄钟状态机（work/short_break/long_break/stopped）
+│   ├── config.py        # 配置管理（ConfigManager，即时写盘、线程安全）
+│   ├── presence.py      # 摄像头在场检测（人脸+人体组合，后台线程）
+│   ├── guards.py        # 监管服务（三个自驱扫描器：工作监管/全程关闭/工作最小化）
+│   ├── process_manager.py  # 进程查找/多策略强杀/失败冷却
+│   ├── stats.py         # 专注时长统计（SQLite：段记录/日周月聚合/streak）
+│   ├── window_minimize.py  # 工作时段最小化应用（EnumWindows + ShowWindow）
+│   └── utils.py         # 工具函数（GBK 解码、进程名规范化、共享常量）
+├── gui/                 # 视图层（只做显示与交互，不含业务判断）
+│   ├── main_window.py   # 主窗口（布局、控件、深色主题/云母）
+│   ├── overlay.py       # 休息全屏遮罩
+│   ├── tray_icon.py     # 系统托盘
+│   ├── widgets.py       # 自绘组件（柱状图、统计面板）
+│   └── theme.py         # 深色主题 QSS、云母、提示音、尺寸常量
 ├── make_icon.py         # 生成 exe 图标
 ├── build_exe.bat        # 一键打包脚本（PyInstaller）
 ├── requirements.txt     # PySide6（必需）+ psutil/opencv（可选）
@@ -29,13 +41,14 @@ pomodoro_guard/
 └── README.md
 ```
 
-界面层与核心逻辑分离：`pomodoro_core.py` 不依赖任何 GUI 框架，可以单独测试、替换界面。
+界面层与核心逻辑分离：`core/` 为纯逻辑层，不依赖任何 GUI 框架，可以单独测试、替换界面；
+`gui/` 只做显示与交互，业务规则集中在 `controller.py`；所有后台线程（监管扫描、摄像头采样）由核心层自管理。
 
 ## 安装与运行
 
 ```bash
 pip install -r requirements.txt     # 安装 PySide6（psutil/opencv 可选）
-python pomodoro_guard.py            # 运行
+python main.py                      # 运行
 ```
 
 > opencv-python-headless 与模型文件 `face_detection_yunet_2023mar.onnx`（人脸）、

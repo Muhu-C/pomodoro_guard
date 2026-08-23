@@ -1,6 +1,6 @@
 # 番茄钟·应用监管（Pomodoro Guard）项目快照
 
-> 生成日期：2026-08-16 · 状态：核心功能全部实测通过，最新 exe 构建稳定（摄像头在场检测、数据统计已加入）
+> 生成日期：2026-08-23 · 状态：模块化重构完成（`core/` + `gui/` + `controller.py` + `main.py` 分层，依赖注入组装），56 项全栈自动化回归全部通过；摄像头在场检测、数据统计、三份监管列表齐备
 
 ---
 
@@ -9,83 +9,76 @@
 | 层面 | 目标 |
 |---|---|
 | 功能 | ① 番茄钟（工作/短休息/长休息周期）② 应用监管（工作阶段强制关闭指定程序）③ 全程应用自动关闭（不受阶段限制全程关闭）④ 工作时段应用自动最小化（工作阶段自动最小化指定窗口）⑤ 摄像头在场检测（离位自动暂停/回位恢复）＋ 专注时长统计（日/周/月/累计 + streak） |
-| 技术 | Python + PySide6 桌面应用；PyInstaller 打包为免安装 exe（目标机器零 Python 运行时） |
+| 技术 | Python + PySide6 桌面应用；**分层架构**（`core/` 纯逻辑、`gui/` 视图、`controller.py` 业务规则、`main.py` 组装）；PyInstaller 打包为免安装 exe（目标机器零 Python 运行时） |
 | 体验 | 深色主题、Win11 云母背景、系统托盘常驻、单例运行、配置自动持久化、阶段切换提示音、数据统计可视化 |
 | 质量 | 界面与核心逻辑分层（可单测）；每轮功能改动均带自动化验证；崩溃/异常优雅回退 |
 
 ---
 
-## 2. 模块架构
+## 2. 模块架构（分层）
 
-### 2.1 核心逻辑层（UI 无关）
+依赖方向严格单向：`main.py → controller.py → core/*`；`gui/*` 只由 `main.py` 实例化、被 `controller` 引用（仅类型提示，不实例化）；**`core/` 禁止导入任何 `gui/` 模块**。所有后台线程（监管扫描、摄像头采样）由核心层自管理，GUI 退出时正确释放。
 
-| 文件 | 行数 | 职责 |
-|---|---|---|
-| `pomodoro_core.py` | 402 | 番茄钟状态机、进程检测/关闭、配置读写、GBK 解码 |
-| `presence.py` | 282 | 摄像头人像在场检测（人脸 + 人体组合，后台线程） |
-| `stats.py` | 144 | 专注时长统计（SQLite 段记录、日/周/月聚合、streak） |
-| `window_minimize.py` | ~150 | 工作时段最小化应用（EnumWindows + ShowWindow） |
-
-**pomodoro_core.py**
-- **ProcessManager**：检测后端自动选择（psutil → PowerShell → tasklist/taskkill）；`find_running` 批量一次调用检测；`kill` 多策略强杀（taskkill 树杀 → Stop-Process → psutil）并复核结果，失败如实上报
-- **PomodoroEngine**：番茄钟状态机（work/short_break/long_break、长休周期、暂停/恢复/重置/跳过、monotonic 计时防漂移）
-- **工具**：`normalize_exe`/`proc_name_of`（进程名规范化）、`decode_bytes`（GBK/UTF-8 自适应，防日志乱码）、`load_config`/`save_config`
-
-**presence.py**
-- **组合检测**：YuNet 人脸 ＋ YOLOv8n 人体（COCO person 类），**任一命中 = 人在**——低头写作业、背对镜头时人脸不可见，由人体检测兜底；两者都检测不到才判"不在"（人离开座位）
-- **PresenceDetector**：后台线程循环，5 秒/次采样 640×480 帧；维护"最近检测到人"的 monotonic 时间戳供上层判定连续不在时长；YOLOv8n 仅取 person 类最高分与阈值比较（无需 NMS）
-- **按需启停**：`enable`/`disable` 幂等；禁用或线程退出时释放摄像头（指示灯熄灭）；未启用/已停用时零占用
-- **优雅降级**：无 opencv、摄像头不可用/被占用/权限拒绝、读取失败 → 整体不可用并记录原因；人脸/人体两模型**相互独立**，缺失或加载失败其一则只用另一个；启用时刻起算"不在时长"，避免启动即误判
-
-**stats.py**
-- **FocusStats**：SQLite（`focus_log` 表：ts/duration_sec/done），段级记录；`add_work_segment` 落库（0/负忽略），`clear` 清空
-- **聚合**：`today_duration`（本地日）、`daily_totals(N)`（近 N 日含 0 补全、升序）、`monthly_totals`（按月，限 24 个月）
-- **streak**：从今天（无 done 则从昨天）往回数连续"有自然结束番茄"的天数，中断归零
-- 今日实时部分（当前未结束工作段）由 UI 层叠加，不写库；阶段结束/跳过/退出时才落库
-
-**window_minimize.py**
-- **算法与示例一致**：`EnumWindows` 枚举可见顶层窗口 → `GetWindowThreadProcessId` 取 PID → psutil 反查进程名 → 目标命中且 `IsIconic=False`（未最小化）才 `ShowWindow(SW_MINIMIZE)`；已最小化跳过，幂等
-- **自身保护**：本程序 PID 的窗口一律跳过（主窗口/休息遮罩不会被自己最小化）
-- **性能**：pid→进程名 TTL 缓存（5s），同一进程多窗口（如 Chrome）不反复调 psutil
-- **降级**：pywin32 或 psutil 缺失 → `available=False` + `error` 原因，功能自动停用，其余功能不受影响
-
-### 2.2 界面层
+### 2.1 核心逻辑层 `core/`（UI 无关，可单测）
 
 | 文件 | 行数 | 职责 |
 |---|---|---|
-| `pomodoro_guard.py` | 1789 | PySide6 主窗口、深色主题、托盘、遮罩、统计、所有功能集成 |
+| `core/engine.py` | ~85 | 番茄钟状态机（work/short_break/long_break/stopped、monotonic 防漂移）；不含"是否自动开始"等策略判断，由控制器判断并调用 |
+| `core/config.py` | ~60 | `ConfigManager`：get/set/save/reload，`threading.RLock` 线程安全，`set()` 即时写盘；旧 `load_config`/`save_config` 保留向后兼容 |
+| `core/presence.py` | ~255 | 摄像头人像在场检测（人脸 + 人体组合，后台线程），只上报"人在/不在 + 连续不在时长"，**不做任何暂停/遮罩决策** |
+| `core/guards.py` | ~230 | `GuardianService`：三个独立扫描器（WorkGuard 工作监管 / AlwaysGuard 全程关闭 / MinimizeGuard 工作最小化），各自独立 QThread + QTimer 自驱 |
+| `core/process_manager.py` | ~210 | 进程批量检测（后端自动选择 psutil → PowerShell → tasklist/taskkill）、多策略强杀、失败冷却、复核不谎报 |
+| `core/stats.py` | ~135 | 专注时长统计（SQLite 段记录、日/周/月聚合、streak） |
+| `core/window_minimize.py` | ~130 | 工作时段最小化应用（EnumWindows + GetWindowThreadProcessId + ShowWindow，幂等，自身 PID 窗口跳过） |
+| `core/utils.py` | ~50 | 工具函数与共享常量：`normalize_exe`/`proc_name_of`/`decode_bytes`（GBK/UTF-8 自适应）、`PHASE_NAMES`、`PHASE_COLORS`、`CREATE_NO_WINDOW`、psutil 探测 |
 
-- **深色主题**：QSS 全控件显式配色（不依赖系统调色板）＋ Mica 半透明变体
-- **云母背景**：`_supports_mica`/`_apply_mica`（win32mica 完整序列：DwmExtendFrameIntoClientArea ＋ HostBackdrop ＋ 属性 20/38）；每次 show 重应用 ＋ 3s 周期重应用（防句柄重建/系统清属性）；旧系统自动回退纯深色
-- **提示音**：内存合成 WAV（淡入淡出）→ 写入临时目录 → `winsound SND_FILENAME|SND_ASYNC` 播放；工作/短休/长休三种音色；开关持久化；失败静默兜底
-- **休息全屏遮罩**：进入休息阶段全屏强制覆盖（无边框/置顶/覆盖所有屏幕/拦截鼠标/禁止关闭）；短休息与长休息独立显示不同内容：短休息显示"请立即看向6米以外的窗外物体，并眨眼10次！"，长休息额外显示"请拿起水杯到厨房倒一杯水"喝水提示；仅主窗口悬浮遮罩上方（未勾选"总在最前"时临时强制置顶、休息结束恢复）；休息结束自动关闭，可勾选关闭该功能；遮罩类型切换时自动重建
-- **收起/展开双模式**：打开默认收起（仅番茄钟+功能按钮）；点「展开设置」显示全部设置配置；进入休息自动收起并移到屏幕右上角（距边缘 24px）；程序只自动收起、从不自动展开
-- **摄像头在场规则**：摄像头按状态启停（仅工作计时中/休息遮罩显示时启用）；专注离开超宽限（默认15s，可配置）自动暂停、人回来自动恢复（区分手动暂停不被自动恢复）；休息人离开超 1 分钟（固定）关闭遮罩且本次不再重开；检测器不可用降级并提示
-- **系统托盘**：左键显示/隐藏主窗口；右键精简状态菜单（阶段/剩余/本轮番茄/监管状态＋控制）；悬浮提示实时剩余时间；关闭按钮/最小化 = 隐藏到托盘
-- **单例保护**：`QLockFile`（崩溃残留自动清理）；第二实例弹提示退出
-- **应用监管**：后台线程扫描＋队列回写日志（界面零卡顿）；60s 失败冷却防刷屏；固定仅工作阶段扫描（休息/暂停/未开始不关闭）；进入休息可选清场
-- **全程应用自动关闭**：独立于应用监管的第二份关闭列表（`always_closed`）；从番茄钟启动到结束**全程强制关闭**（不受工作/休息/暂停/空闲阶段限制扫描）；与监管列表共享后台扫描线程但独立冷却与日志标识（`[全程关闭]`）；启用开关、列表增删清均独立持久化
-- **设置持久化**：全部设置即时保存、启动自动读取
-- **设置区滚动**：「设置·监管」页整体包裹 `QScrollArea`（无边框、自适应大小、禁用横向滚动条 `ScrollBarAlwaysOff`），内容超出可视区时仅出现纵向滚动条；「番茄钟设置」分组框控件间距增大至 11px（原 6px 的 ≈180%），视觉更宽松
-- **自绘柱状图**：统计数据可视化，无需第三方图表库
+**core/guards.py 设计要点**：
+- 三个扫描器继承 `_BaseGuard`，各自运行在独立 QThread 事件循环，QTimer 周期触发（首次启动立即扫描一次）；扫描间隔/列表从 config 实时读取，间隔变化立即重设定时器
+- 启动/停止/强制清场经 `QMetaObject.invokeMethod(..., Qt.QueuedConnection)` 跨线程调用（均为 `@Slot()`）
+- `force_scan`（进入休息强制清场）绕过启用开关与 60s 失败冷却
+- 每个扫描器有独立失败冷却字典；统一 `log_emitted(str)` 信号由控制器转发给 GUI
 
-### 2.3 工具与资源
+### 2.2 总控制器 `controller.py`（~545 行，业务规则枢纽）
+
+- **职责**：GUI 的每个用户操作（点击按钮、勾选开关）只调用控制器的一个方法（一行代码）；控制器连接核心信号，内部维护所有 if-else 业务判断。
+- **输出信号**：`tick_updated`（200ms 心跳）、`phase_changed`（阶段切换，GUI 据此播提示音）、`log_appended`（日志）、`overlay_requested`（遮罩请求，GUI 负责创建/销毁遮罩实例）、`stats_changed`（统计页刷新）、`presence_alert`（摄像头降级提示）。
+- **公开方法**：计时（start_timer/pause_timer/resume_timer/skip_stage/reset_timer/apply_timer_settings）、监管三开关（toggle_guard/toggle_always_close/toggle_minimize）、三份列表增删清（add/remove/clear monitored/always/minimize apps）、通用 `update_setting(key, value)`、`toggle_presence`/`toggle_rest_overlay`、`clear_stats`、`on_quit`；查询：`monitor_status_text`/`presence_status`/`live_focus_extra`/`enforcement_active`/`always_close_active`/`minimize_active`。
+- **内部规则**（从旧 GUI 回调提取）：`_on_tick`（200ms 轮询引擎状态、检测阶段自然结束）、`_on_phase_transition`（阶段切换统一处理：遮罩同步 + 强制清场 + 监管调度）、`_check_presence_rules`（专注离开超宽限→自动暂停；人回来→自动恢复；休息无人超 60s→关遮罩）、`_update_presence`（按状态幂等启停摄像头）、`_sync_overlay`、`_sync_guards_for_state`（按引擎状态+配置启停扫描器）、`_log_work_segment`（工作段落库）。
+- **关键设计**：`_presence_paused` 标记区分"手动暂停"与"离开暂停"（手动暂停不被摄像头自动恢复）；提示音职责分离（控制器只发 `phase_changed`，GUI 按 `sound_enabled` 配置播放）；遮罩请求式架构（控制器不持有遮罩实例）；重置时 `_stop_all_guards` 仅停定时器、程序退出才 `GuardianService.stop_all()` 退出线程。
+
+### 2.3 界面层 `gui/`（只做显示与交互，不含业务判断）
+
+| 文件 | 行数 | 职责 |
+|---|---|---|
+| `gui/main_window.py` | ~825 | 主窗口：布局、控件、信号绑定、深色主题/云母、收起/展开双模式、设置区滚动；内部自建系统托盘 |
+| `gui/overlay.py` | ~90 | 休息全屏遮罩（短/长不同文本、多屏联合几何、鼠标/键盘事件拦截） |
+| `gui/tray_icon.py` | ~190 | 系统托盘（QPainter 自绘番茄图标、左键显隐、右键状态菜单、tooltip） |
+| `gui/widgets.py` | ~235 | 自绘柱状图 BarChart、统计面板 StatsPanel（四档+streak+清除）、format_duration |
+| `gui/theme.py` | ~250 | 深色 QSS 与云母变体、阶段配色 DARK_PHASE_COLORS、supports_mica/apply_mica、内存合成提示音 play_state_sound、尺寸常量 |
+
+**禁则**：GUI 不直接访问 `PomodoroEngine`/`PresenceDetector`/`GuardianService` 等核心类，不直接读写 config，不编写业务 if-else 判断。
+
+### 2.4 入口 `main.py`（~60 行）
+
+组装顺序：`QApplication` + 单例锁（`acquire_lock`，第二实例弹提示退出、崩溃残留锁自动清理）→ 实例化 core/*（无 GUI 依赖）→ `ApplicationController`（注入 config/engine/presence/guards/stats）→ `MainWindow(controller)`（内部自建托盘）→ show → `app.exec()`。退出清理由托盘「退出」/「以管理员身份重启」两条显式路径调用 `controller.on_quit()`（落库 + 释放摄像头 + 停止扫描器线程）；不挂 `aboutToQuit`（`on_quit` 中段落落库非幂等，重复调用会重复写库）。
+
+### 2.5 工具与资源
 
 | 文件 | 说明 |
 |---|---|
 | `make_icon.py` | 用 QPainter 生成番茄 `icon.ico`（复用托盘图标绘制） |
-| `build_exe.bat` | 一键打包（onedir+windowed），自动定位依赖目录、依赖自检、打包两个摄像头模型 |
+| `build_exe.bat` | 一键打包（onedir+windowed，入口 `main.py`，自动定位依赖目录、依赖自检、打包两个摄像头模型） |
 | `requirements.txt` | PySide6（必需）、psutil/opencv（可选） |
 | `face_detection_yunet_2023mar.onnx` | YuNet 人脸检测模型（~230KB） |
 | `person_det.onnx` | YOLOv8n 人体检测模型（~12MB，COCO person 类，低头/背对镜头兜底） |
 | `icon.ico` | exe/窗口/托盘图标 |
 | `README.md` | 架构、安装、打包、使用说明 |
 
-### 2.4 运行时产物
+### 2.6 运行时产物
 
 | 文件 | 说明 |
 |---|---|
-| `pomodoro_guard_config.json` | 自动生成：监管列表/间隔/时长/全部开关 |
+| `pomodoro_guard_config.json` | 自动生成：监管列表/间隔/时长/全部开关（**格式未变，老用户平滑升级**） |
 | `pomodoro_guard_stats.db` | 自动生成：专注时长统计库（SQLite，勿手动编辑） |
 | `dist/PomodoroGuard/` | 交付物：`PomodoroGuard.exe`＋`_internal\`（免安装，整文件夹分发） |
 
@@ -141,7 +134,8 @@
 **打包与工程**
 - [x] PyInstaller onedir 免安装 exe（无需 Python 运行时；排除未用 Qt 模块减体积）
 - [x] 一键打包脚本（自动定位依赖、依赖自检、自动生成图标）
-- [x] 核心/界面分层，每轮改动带 offscreen＋真实窗口自动化验证
+- [x] **模块化分层重构**：单体 `pomodoro_guard.py`（~1800 行）拆分为 `core/`（纯逻辑）＋ `gui/`（视图）＋ `controller.py`（业务规则）＋ `main.py`（依赖注入组装），依赖方向单向、core 不导入 gui（详见 §5）
+- [x] 核心/界面分层，每轮改动带 offscreen＋真实窗口自动化验证（重构后累计 158 项回归：_step7 36 + _step8 53 + _step9 16 + _step11 56）
 
 ---
 
@@ -151,8 +145,8 @@
 
 | 项 | 说明 |
 |---|---|
-| **中文路径导致摄像头检测失效** | 软件目录含中文（如 `桌面\番茄钟`）时：`os.path.exists` 判定模型存在，但 `cv2.FaceDetectorYN.create`/`cv2.dnn.readNetFromONNX` 内部用窄字符 fopen，无法打开中文路径 → 人脸/人体双模型加载失败 → 摄像头已打开但检测永不工作（灯亮、Windows 显示"正在使用摄像头"、状态栏"不可用"）；E 盘纯 ASCII 路径正常。已用 OpenCV 5.0.0 实测复现。**规避**：目录改纯英文；**根治**：presence.py 加载前把模型复制到 ASCII 临时目录再交给 cv2 |
-| **模型加载失败时摄像头句柄泄漏** | `presence.py` 的 `_run()` 在 `_acquire()` 返回 False 的失败分支直接 return，未调用 `_release()` → 摄像头保持打开（灯常亮、被占用）；成功路径由 finally 释放，仅失败路径泄漏。**修复**：失败分支补 `_release()` |
+| **中文路径导致摄像头检测失效** | 软件目录含中文（如 `桌面\番茄钟`）时：`os.path.exists` 判定模型存在，但 `cv2.FaceDetectorYN.create`/`cv2.dnn.readNetFromONNX` 内部用窄字符 fopen，无法打开中文路径 → 人脸/人体双模型加载失败 → 摄像头已打开但检测永不工作（灯亮、Windows 显示"正在使用摄像头"、状态栏"不可用"）。**规避**：目录改纯英文；**根治**：`core/presence.py` 加载前把模型复制到 ASCII 临时目录再交给 cv2 |
+| **模型加载失败时摄像头句柄泄漏** | `core/presence.py` 的 `_run()` 在 `_acquire()` 返回 False 的失败分支直接 return，未调用 `_release()` → 摄像头保持打开（灯常亮、被占用）；成功路径由 finally 释放，仅失败路径泄漏。**修复**：失败分支补 `_release()` |
 
 ### 设计限制与已知约束
 
@@ -170,7 +164,82 @@
 
 ---
 
-## 5. 下一步待开发任务
+## 5. 模块化重构实施记录（迁移自原 Project_Upgrade.md）
+
+### 5.1 背景与目标
+
+- **痛点**：单体 `pomodoro_guard.py`（~90KB/约 1800 行）揉合 UI 布局、事件绑定、摄像头规则、后台线程扫描、统计图表、遮罩控制、托盘逻辑；GUI 回调直接操作 `PomodoroEngine`/`PresenceDetector`/`ProcessManager` 并直接读写配置；业务规则（如"人离开超 15 秒自动暂停"）与 GUI 生命周期捆绑，无法单独单测；多线程职责不清。
+- **目标**（用户选型）：① 状态机与判断上收为总控制器（ApplicationController）主导；② 配置保持即时写盘（外部修改仅重启后生效，不做热加载）；③ 摄像头保持纯粹（只输出"人在/不在"及离开时长，不做暂停/遮罩决策）；④ 监管逻辑全部下沉核心层，自带 QThread/QTimer 自驱扫描，GUI 一行 start/stop；⑤ GUI 彻底瘦身，每个用户操作只调用控制器一个方法；⑥ 入口 `main.py` 完成所有模块实例化、依赖注入与组装。
+- **约束（不可违反）**：`core/` 不允许导入任何 `gui/` 模块；`controller.py` 可导入 core 和 gui（gui 仅类型声明，不实例化）；所有后台线程由核心层自管理，GUI 退出时正确释放；配置持久化继续使用 `pomodoro_guard_config.json`，格式不变，老用户平滑升级。
+
+### 5.2 迁移检查清单（11 步全部完成）
+
+| 步骤 | 任务 | 产出 | 状态 |
+|---|---|---|---|
+| 1 | 新建 `core/`、`gui/` 目录与 `__init__.py` | 目录骨架 | ✅ |
+| 2 | 原 `pomodoro_core.py` 拆分为 `core/engine.py`、`config.py`、`process_manager.py`、`utils.py` | 核心工具类 | ✅ |
+| 3 | 原 `presence.py` → `core/presence.py`（微调模型定位：非冻结态用 dirname(dirname(__file__)) 回溯项目根） | 摄像头模块 | ✅ |
+| 4 | 原 `stats.py` → `core/stats.py`（微调统计库路径定位，位置与重构前一致） | 统计模块 | ✅ |
+| 5 | 新建 `core/guards.py`：三个独立扫描器（WorkGuard/AlwaysGuard/MinimizeGuard），`core/config.py` 新增 `ConfigManager`（RLock 线程安全），`core/window_minimize.py` 从顶层迁移 | 监管服务 | ✅ |
+| 6 | 新建 `controller.py`：所有业务规则（if-else 判断）从 GUI 回调提取至此 | 控制器 | ✅ |
+| 7 | 原 `pomodoro_guard.py` → `gui/main_window.py`：移除所有逻辑，只留 UI 布局和信号绑定（瘦身目标 <400 行未达成，约 830 行——四组设置区布局代码本身较长；"移除业务逻辑"目标已达成） | 瘦身主窗口 | ✅ |
+| 8 | 剥离 `gui/overlay.py`、`tray_icon.py`、`widgets.py`、`theme.py` | 辅助 GUI 组件 | ✅ |
+| 9 | 新建 `main.py`：依赖注入与组装 | 新入口 | ✅ |
+| 10 | 删除旧顶层 `pomodoro_guard.py`/`pomodoro_core.py`/`presence.py`/`stats.py`/`window_minimize.py`；`build_exe.bat`/`PomodoroGuard.spec` 入口点改为 `main.py`；引用完整性核验无残留 import | 收尾 | ✅ |
+| 11 | 功能回归：番茄钟切换、监管关闭、摄像头自动暂停、遮罩显示、统计实时更新（56 项全通过） | 回归 | ✅ |
+
+### 5.3 实施中修复的关键问题（步骤 7 记录）
+
+1. **配置加载信号回授**：原 `_load_config_to_ui` 直接 setChecked/setValue 触发已连接的控制器回调 → 重复写盘、误日志、构造期间过早 show。修复：加载期间对相关控件 `blockSignals`，结束统一恢复。
+2. **摄像头降级提示刷屏**：原每 tick 重置 `_presence_err_logged` → 不可用时每秒刷 5 条。修复：仅"启用边沿"（False→True）重置一次，不可用期间只提示一次。
+3. **重置后全程关闭失效**：原 `reset_timer` 停掉全部扫描器且不再恢复。修复：改调 `_sync_guards_for_state()`，全程关闭保持"启用即运行"（旧版行为）。
+4. **启动时初始调度缺失**：修复：`__init__` 末尾调用一次 `_sync_guards_for_state()`（配置启用"全程关闭"开机即生效）。
+5. **进入休息强制清场语义偏差**：新 WorkGuard._scan 受开关与冷却限制，旧版 force=True 绕过。修复：`force_scan` → `_scan(force=True)`，force 时绕过开关与冷却。
+6. **扫描间隔不实时生效**：原仅 start() 时读一次。修复：每次扫描后检查配置间隔，变化立即重设定时器。
+7. **退出竞态**：on_quit 关闭统计库后心跳 tick 仍可能访问 → SQLite 异常。修复：先停 `_tick_timer`。
+8. **跨线程定时器警告**：stop_all 直接在主线程调 worker 线程 QTimer.stop。修复：改用 `QMetaObject.invokeMethod(..., Qt.QueuedConnection)`。
+9. **细节**：主窗口未设图标；降级提示文案缺"摄像头检测不可用，已降级:"前缀；QFont/QRect/time 内联导入整理为顶层。
+
+### 5.4 与设计草图的偏差（步骤 9 记录）
+
+1. **托盘创建**：草图要求 main.py 创建 `TrayIcon(controller, window)`，实际 `MainWindow.__init__` 内部已自建托盘（`gui/main_window.py`），main.py 直接实例化 MainWindow 即可。
+2. **单例锁位置**：`acquire_lock()` 在 `gui/main_window.py` 定义并经 `gui/__init__.py` 导出，main.py 直接导入使用。
+3. **退出清理**：不挂 `app.aboutToQuit` → `guards.stop_all`/`presence.disable`（`controller.on_quit()` 中 `_log_work_segment(done=False)` 非幂等，重复调用重复写库）；退出清理仅由托盘「退出」/「以管理员身份重启」两条显式路径调用 `controller.on_quit()`。
+4. **托盘常驻**：未设 `setQuitOnLastWindowClosed(False)`（旧版 main() 不设此标志；托盘不可用时 closeEvent accept 自动退出，保持与旧版一致）。
+
+### 5.5 自动化验证记录
+
+- `_step7_verify.py`：**36 项**全栈回归（组装 → 启动调度 → 计时/阶段切换 → 遮罩（短/长）→ 重置 → 列表管理 → force 清场 → 间隔同步 → 收起/展开 → 退出清理）；另以不可用检测器桩验证降级提示 3 秒内仅 1 条。
+- `_step8_verify.py`：**53 项**（剥离组件独立性）：RestOverlay 短/长文本与几何、TrayIcon 菜单构建与 tooltip、format_duration 边界、BarChart 渲染与空数据、StatsPanel 四档刷新、theme 工具与尺寸常量、gui 包导出完整性、退出清理线程释放。
+- `_step9_verify.py`：normal **13 项**（组装、初始调度、清理、配置/统计库隔离验证）＋ lock **3 项**（单例锁冲突返回 0、弹出提示、未创建窗口）。
+- `_step11_verify.py`：**56 项**全栈回归（offscreen + PresenceStub 替代真实摄像头），验收条目（§5.7）全绿，exit 0。
+- 所有验证脚本均把配置/统计库重定向到临时副本（如 `_step11_tmp`），不动真实数据。
+
+### 5.6 风险提示与注意事项
+
+1. **线程安全**：guards.py 扫描器运行在 QThread，`process_manager.kill()` 为阻塞操作，切勿在 GUI 线程直接调用；config.get() 只读并发可接受（配置变更仅主线程触发）。
+2. **信号连接**：controller 与 main_window 的信号/槽使用默认 `Qt.AutoConnection`，跨线程信号自动排队，无需手动加锁。
+3. **配置即时写盘**：`ConfigManager.set()` 内 save() 为同步 I/O，GUI 高频修改（如拖动滑块）可能短暂卡顿；可防抖，但现有设置项 <20 个预计无碍。
+4. **旧配置文件兼容**：读取缺失字段用默认值填充并保存，老用户升级不丢数据。
+5. **单例锁**：仍在 main.py 的 QLockFile，跨模块不共享锁文件逻辑。
+
+### 5.7 验收标准（回归场景，全部通过）
+
+- [x] 点击"开始" → 计时倒计时，进入工作阶段监管生效（若启用）。
+- [x] 点击"暂停" → 倒计时暂停（手动暂停时摄像头检测随之停用、恢复计时时重新启用；仅"离开暂停"期间摄像头保持运行以支持自动恢复）。
+- [x] 人离开摄像头超 15 秒 → 自动暂停；人回来 → 自动恢复。
+- [x] 进入短休息/长休息 → 自动全屏遮罩，短休和长休内容不同。
+- [x] 休息时人离开超 60 秒 → 遮罩关闭，本次休息不再重开。
+- [x] "应用监管"列表中的进程在工作阶段被杀，休息阶段不杀。
+- [x] "全程自动关闭"列表中的进程在包括休息、暂停在内的任何时间被杀。
+- [x] "工作时段最小化"列表中的进程在工作运行时被最小化，暂停/休息时不触发。
+- [x] 统计页"今日/本周/本月/累计"数字与柱状图显示正常。
+- [x] 展开设置页修改任意项 → 配置即时保存，重启读取正确。
+- [x] 托盘菜单"显示/隐藏"、"开始/暂停"、"跳过"、"重置"、"退出"全部正常。
+
+---
+
+## 6. 下一步待开发任务
 
 - [ ] **（可选）提示音音量/音调可调**，或改用系统通知音
 - [ ] **（可选）监管规则增强**：时间段规则（如工作日禁游戏）、累计时长上限、白名单

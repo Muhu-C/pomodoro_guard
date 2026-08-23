@@ -55,7 +55,7 @@ python -m PyInstaller --noconfirm --clean --onedir --windowed ^
   --exclude-module PySide6.QtTest ^
   --exclude-module PySide6.QtOpenGL ^
   --exclude-module PySide6.QtOpenGLWidgets ^
-  pomodoro_guard.py || goto :err
+  main.py || goto :err
 
 echo.
 echo Build complete! Entry: dist\PomodoroGuard\PomodoroGuard.exe
