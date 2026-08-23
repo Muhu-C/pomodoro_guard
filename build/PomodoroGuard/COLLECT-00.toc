@@ -585,6 +585,9 @@
   ('person_det.onnx',
    'E:\\dshn-workspace\\pomodoro_guard\\person_det.onnx',
    'DATA'),
+  ('psutil\\_psutil_windows.pyd',
+   'C:\\Users\\MC118\\AppData\\Local\\Packages\\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\\LocalCache\\local-packages\\Python313\\site-packages\\psutil\\_psutil_windows.pyd',
+   'EXTENSION'),
   ('pyexpat.pyd',
    'C:\\Program '
    'Files\\WindowsApps\\PythonSoftwareFoundation.Python.3.13_3.13.3824.0_x64__qbz5n2kfra8p0\\DLLs\\pyexpat.pyd',
@@ -599,6 +602,9 @@
   ('python313.dll',
    'C:\\Program '
    'Files\\WindowsApps\\PythonSoftwareFoundation.Python.3.13_3.13.3824.0_x64__qbz5n2kfra8p0\\python313.dll',
+   'BINARY'),
+  ('pywin32_system32\\pywintypes313.dll',
+   'C:\\Users\\MC118\\AppData\\Local\\Packages\\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\\LocalCache\\local-packages\\Python313\\site-packages\\pywin32_system32\\pywintypes313.dll',
    'BINARY'),
   ('select.pyd',
    'C:\\Program '
@@ -617,6 +623,15 @@
   ('unicodedata.pyd',
    'C:\\Program '
    'Files\\WindowsApps\\PythonSoftwareFoundation.Python.3.13_3.13.3824.0_x64__qbz5n2kfra8p0\\DLLs\\unicodedata.pyd',
+   'EXTENSION'),
+  ('win32\\win32gui.pyd',
+   'C:\\Users\\MC118\\AppData\\Local\\Packages\\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\\LocalCache\\local-packages\\Python313\\site-packages\\win32\\win32gui.pyd',
+   'EXTENSION'),
+  ('win32\\win32pdh.pyd',
+   'C:\\Users\\MC118\\AppData\\Local\\Packages\\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\\LocalCache\\local-packages\\Python313\\site-packages\\win32\\win32pdh.pyd',
+   'EXTENSION'),
+  ('win32\\win32process.pyd',
+   'C:\\Users\\MC118\\AppData\\Local\\Packages\\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\\LocalCache\\local-packages\\Python313\\site-packages\\win32\\win32process.pyd',
    'EXTENSION'),
   ('winsound.pyd',
    'C:\\Program '

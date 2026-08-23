@@ -33,8 +33,8 @@ from PySide6.QtGui import (QAction, QColor, QCursor, QFont, QIcon, QPainter,
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QCheckBox, QDoubleSpinBox, QGroupBox,
     QHBoxLayout, QLabel, QLineEdit, QListWidget, QMainWindow, QMenu,
-    QMessageBox, QPlainTextEdit, QPushButton, QSpinBox, QSystemTrayIcon,
-    QTabWidget, QToolTip, QVBoxLayout, QWidget,
+    QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSpinBox,
+    QSystemTrayIcon, QTabWidget, QToolTip, QVBoxLayout, QWidget,
 )
 
 from pomodoro_core import (
@@ -43,6 +43,7 @@ from pomodoro_core import (
 )
 from presence import PresenceDetector
 from stats import FocusStats
+from window_minimize import WindowMinimizeManager
 
 APP_TITLE = "番茄钟 · 应用监管"
 
@@ -56,6 +57,9 @@ TOP_RIGHT_MARGIN = 24                    # 自动收起时距屏幕右上角的�
 
 # 摄像头在场检测：休息阶段人离开超过该秒数则关闭遮罩（固定值，不提供配置）
 REST_AWAY_SECONDS = 60.0
+
+# 工作时段最小化应用：固定每 5 秒检测一次（不提供配置，与需求一致）
+MINIMIZE_INTERVAL = 5.0
 
 
 def acquire_lock():
@@ -318,7 +322,8 @@ QSS_MICA = QSS.replace(
 # 休息全屏遮罩
 # 进入休息阶段时强制全屏覆盖（仅本软件主窗口悬浮其上），提醒放松双眼。
 # ---------------------------------------------------------------------------
-REST_OVERLAY_TEXT = "请立即看向6米以外的窗外物体，并眨眼10次！"
+REST_OVERLAY_TEXT_SHORT = "请立即看向6米以外的窗外物体，并眨眼10次！"
+REST_OVERLAY_TEXT_LONG = "请立即看向6米以外的窗外物体，并眨眼10次！\n\n请拿起水杯到厨房倒一杯水"
 
 
 class RestOverlay(QWidget):
@@ -326,13 +331,20 @@ class RestOverlay(QWidget):
 
     中央显示护眼提醒文本；不接收焦点（键盘焦点留在主窗口），且禁止被关闭
     （closeEvent 忽略），只能由主窗口按阶段切换显示/隐藏。
+    支持短休息和长休息两种模式，长休息额外显示喝水提示。
     """
 
-    def __init__(self):
+    def __init__(self, overlay_type="short"):
+        """初始化遮罩。
+        
+        Args:
+            overlay_type: "short" 短休息 或 "long" 长休息
+        """
         super().__init__(None, Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint
                          | Qt.Tool)
         self.setAttribute(Qt.WA_ShowWithoutActivating, True)
         self.setWindowTitle("休息提醒")
+        self._overlay_type = overlay_type
         self._build()
 
     def _build(self):
@@ -342,11 +354,18 @@ class RestOverlay(QWidget):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(40, 40, 40, 40)
 
+        # 根据休息类型选择文本
+        if self._overlay_type == "long":
+            text = REST_OVERLAY_TEXT_LONG
+            px = max(24, min(48, int(vg.width() / 20)))  # 长休息文字稍小以容纳更多内容
+        else:
+            text = REST_OVERLAY_TEXT_SHORT
+            px = max(28, min(56, int(vg.width() / 18)))
+        
         # 中央大字护眼提醒，字号按屏幕宽度自适应
-        label = QLabel(REST_OVERLAY_TEXT)
+        label = QLabel(text)
         label.setAlignment(Qt.AlignCenter)
         label.setWordWrap(True)
-        px = max(28, min(56, int(vg.width() / 18)))
         label.setStyleSheet(
             f"color: #f5f6fa; font-size: {px}px; font-weight: bold; "
             "background: transparent;")
@@ -621,7 +640,11 @@ class MainWindow(QMainWindow):
         self.engine = PomodoroEngine()
         self.cfg = load_config()
         self.monitored = []              # 监管的应用名列表
+        self.always_closed = []          # 全程应用自动关闭列表（不受阶段限制）
+        self.work_minimized = []         # 工作时段最小化应用列表（仅工作运行中生效）
         self._scan_busy = False          # 后台扫描进行中标记
+        self._minimize_busy = False      # 最小化扫描进行中标记
+        self._last_minimize_scan = 0.0   # 上次最小化扫描时间戳(monotonic)
         self._log_queue = queue.Queue()  # 后台线程 -> 主线程日志队列
         self._fail_cooldown = {}         # exe -> 下次重试时间(monotonic)
         self._fail_msg = {}              # exe -> 上次失败详情
@@ -637,6 +660,7 @@ class MainWindow(QMainWindow):
         self._presence_paused = False  # 是否因"离开"自动暂停（可被自动恢复）
         self._presence_err_logged = False  # 摄像头不可用是否已记录日志
         self._stats = FocusStats()    # 专注时长统计（SQLite）
+        self._minimizer = WindowMinimizeManager()  # 工作时段最小化（窗口枚举）
 
         self._build_ui()
         self._load_config_to_ui()
@@ -645,6 +669,9 @@ class MainWindow(QMainWindow):
                          "tasklist": "tasklist/taskkill (内置)"}
         self.log(f"程序启动，检测后端: {backend_names.get(self.pm.backend, self.pm.backend)}")
         self.log(f"设置文件: {CONFIG_PATH}")
+        if not self._minimizer.available:
+            self.log(f"! 工作时段最小化功能不可用: {self._minimizer.error}，"
+                     f"该功能将保持关闭")
 
         # 定时器：200ms 刷新倒计时与日志队列；1s 驱动扫描调度
         self._tick = QTimer(self)
@@ -724,7 +751,7 @@ class MainWindow(QMainWindow):
         self.lbl_phase = QLabel(PHASE_NAMES["work"])
         self.lbl_phase.setAlignment(Qt.AlignCenter)
         self.lbl_phase.setStyleSheet(
-            f"font-size: 15px; font-weight: bold; color: {DARK_PHASE_COLORS['work']};")
+            f"font-size: 20px; font-weight: bold; color: {DARK_PHASE_COLORS['work']};")
         root.addWidget(self.lbl_phase)
 
         self.lbl_time = QLabel("25:00")
@@ -766,12 +793,28 @@ class MainWindow(QMainWindow):
 
         # ======== Tab 1：设置·监管 ========
         self.tab_settings = QWidget()
-        tv = QVBoxLayout(self.tab_settings)
-        tv.setContentsMargins(8, 8, 8, 8)
+        root_layout = QVBoxLayout(self.tab_settings)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+
+        # 创建滚动区域使页面可滚动
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setFrameShape(QScrollArea.NoFrame)
+        self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        # 创建一个容器 widget 用于存放所有设置内容
+        self.scroll_content = QWidget()
+        self.scroll_layout = QVBoxLayout(self.scroll_content)
+        self.scroll_layout.setContentsMargins(8, 8, 8, 8)
+        self.scroll_layout.setSpacing(8)
+        # 将容器设置为滚动区域的内容
+        self.scroll_area.setWidget(self.scroll_content)
+        root_layout.addWidget(self.scroll_area)
 
         # ---- 番茄钟设置 ----
         grp_settings = QGroupBox("番茄钟设置")
         v = QVBoxLayout(grp_settings)
+        # 增大控件间距，使高度达到原来的180%（原默认间距约6px，现设为11px ≈ 180%）
+        v.setSpacing(11)
 
         # 第一行：工作时长 + 短休息
         row1 = QHBoxLayout()
@@ -837,7 +880,7 @@ class MainWindow(QMainWindow):
         row3.addWidget(btn_apply)
         row3.addWidget(btn_admin)
         v.addLayout(row3)
-        tv.addWidget(grp_settings)
+        self.scroll_layout.addWidget(grp_settings)
 
         # ---- 应用监管 ----
         grp_mon = QGroupBox("应用监管")
@@ -851,14 +894,6 @@ class MainWindow(QMainWindow):
         mrow1.addWidget(self.chk_monitor)
         mrow1.addStretch(1)
         v.addLayout(mrow1)
-
-        mrow2 = QHBoxLayout()
-        self.chk_phase_gate = QCheckBox("仅工作阶段监管(休息/暂停/未开始不关闭)")
-        self.chk_phase_gate.setChecked(True)
-        self.chk_phase_gate.toggled.connect(self._save_config)
-        mrow2.addWidget(self.chk_phase_gate)
-        mrow2.addStretch(1)
-        v.addLayout(mrow2)
 
         # 检测间隔单独一行
         mrow3 = QHBoxLayout()
@@ -892,7 +927,97 @@ class MainWindow(QMainWindow):
         self.list_apps = QListWidget()
         self.list_apps.setMaximumHeight(110)
         v.addWidget(self.list_apps)
-        tv.addWidget(grp_mon)
+        self.scroll_layout.addWidget(grp_mon)
+
+        # ---- 全程应用自动关闭 ----
+        grp_always = QGroupBox("全程应用自动关闭")
+        v2 = QVBoxLayout(grp_always)
+
+        # 启用开关
+        arow1 = QHBoxLayout()
+        self.chk_always_close = QCheckBox("启用全程自动关闭")
+        self.chk_always_close.setChecked(False)
+        self.chk_always_close.toggled.connect(self._toggle_always_close)
+        arow1.addWidget(self.chk_always_close)
+        arow1.addStretch(1)
+        v2.addLayout(arow1)
+
+        # 说明文字
+        arow2 = QHBoxLayout()
+        lbl_hint = QLabel("以下应用从番茄钟启动到结束全程强制关闭（不受阶段限制）")
+        lbl_hint.setStyleSheet("color: #9d9d9d; font-size: 11px;")
+        arow2.addWidget(lbl_hint)
+        arow2.addStretch(1)
+        v2.addLayout(arow2)
+
+        # 输入和按钮
+        arow3 = QHBoxLayout()
+        self.edit_always_app = QLineEdit()
+        self.edit_always_app.setPlaceholderText("程序名，如 chrome 或 notepad.exe，回车添加")
+        self.edit_always_app.returnPressed.connect(self._add_always_app)
+        arow3.addWidget(self.edit_always_app, 1)
+        self.btn_add_always = QPushButton("添加")
+        self.btn_del_always = QPushButton("删除选中")
+        self.btn_clear_always = QPushButton("清空")
+        self.btn_add_always.clicked.connect(self._add_always_app)
+        self.btn_del_always.clicked.connect(self._remove_always_app)
+        self.btn_clear_always.clicked.connect(self._clear_always_apps)
+        arow3.addWidget(self.btn_add_always)
+        arow3.addWidget(self.btn_del_always)
+        arow3.addWidget(self.btn_clear_always)
+        v2.addLayout(arow3)
+
+        self.list_always_apps = QListWidget()
+        self.list_always_apps.setMaximumHeight(110)
+        v2.addWidget(self.list_always_apps)
+        self.scroll_layout.addWidget(grp_always)
+
+        # ---- 工作时段最小化应用 ----
+        grp_min = QGroupBox("工作时段最小化应用")
+        v3 = QVBoxLayout(grp_min)
+
+        # 启用开关
+        nrow1 = QHBoxLayout()
+        self.chk_minimize = QCheckBox("启用工作时段最小化")
+        self.chk_minimize.setChecked(False)
+        self.chk_minimize.toggled.connect(self._toggle_minimize)
+        nrow1.addWidget(self.chk_minimize)
+        nrow1.addStretch(1)
+        v3.addLayout(nrow1)
+
+        # 说明文字
+        nrow2 = QHBoxLayout()
+        lbl_hint_min = QLabel(
+            "以下应用在工作阶段计时运行中（非暂停）会被自动最小化，"
+            "固定每 5 秒检测一次；用户手动恢复窗口后会被再次最小化；"
+            "本程序自身窗口不受影响")
+        lbl_hint_min.setStyleSheet("color: #9d9d9d; font-size: 11px;")
+        lbl_hint_min.setWordWrap(True)
+        nrow2.addWidget(lbl_hint_min)
+        nrow2.addStretch(1)
+        v3.addLayout(nrow2)
+
+        # 输入和按钮
+        nrow3 = QHBoxLayout()
+        self.edit_minimize_app = QLineEdit()
+        self.edit_minimize_app.setPlaceholderText("程序名，如 chrome 或 notepad.exe，回车添加")
+        self.edit_minimize_app.returnPressed.connect(self._add_minimize_app)
+        nrow3.addWidget(self.edit_minimize_app, 1)
+        self.btn_add_minimize = QPushButton("添加")
+        self.btn_del_minimize = QPushButton("删除选中")
+        self.btn_clear_minimize = QPushButton("清空")
+        self.btn_add_minimize.clicked.connect(self._add_minimize_app)
+        self.btn_del_minimize.clicked.connect(self._remove_minimize_app)
+        self.btn_clear_minimize.clicked.connect(self._clear_minimize_apps)
+        nrow3.addWidget(self.btn_add_minimize)
+        nrow3.addWidget(self.btn_del_minimize)
+        nrow3.addWidget(self.btn_clear_minimize)
+        v3.addLayout(nrow3)
+
+        self.list_minimize_apps = QListWidget()
+        self.list_minimize_apps.setMaximumHeight(110)
+        v3.addWidget(self.list_minimize_apps)
+        self.scroll_layout.addWidget(grp_min)
 
         # ---- 日志 ----
         grp_log = QGroupBox("日志")
@@ -901,7 +1026,7 @@ class MainWindow(QMainWindow):
         self.log_text.setReadOnly(True)
         self.log_text.setMaximumBlockCount(2000)
         v.addWidget(self.log_text)
-        tv.addWidget(grp_log, 1)
+        self.scroll_layout.addWidget(grp_log, 1)
         self.tabs.addTab(self.tab_settings, "设置·监管")
 
         # ======== Tab 2：统计 ========
@@ -953,19 +1078,38 @@ class MainWindow(QMainWindow):
     def _on_pause(self):
         eng = self.engine
         if eng.state == "running":
-            eng.pause()
-            self._presence_paused = False  # 手动暂停：不会被摄像头自动恢复
-            self.log("已暂停")
+            # 异步确认：计时继续，用户确认后再暂停
+            self._show_async_confirm(
+                "暂停确认",
+                "确定要暂停当前番茄钟吗？",
+                self._do_pause
+            )
         elif eng.state == "paused":
             eng.resume()
             self._presence_paused = False  # 手动恢复：接管控制权（人不在会再次自动暂停）
             self.log("继续计时")
+            self._update_timer_display()
+
+    def _do_pause(self):
+        """用户确认后执行的实际暂停操作。"""
+        self.engine.pause()
+        self._presence_paused = False  # 手动暂停：不会被摄像头自动恢复
+        self.log("已暂停")
         self._update_timer_display()
 
     def _on_skip(self):
         if self.engine.state == "idle":
             self._on_start()
             return
+        # 异步确认：计时继续，用户确认后再跳过
+        self._show_async_confirm(
+            "跳过确认",
+            "确定要跳过当前阶段吗？",
+            self._do_skip
+        )
+
+    def _do_skip(self):
+        """用户确认后执行的实际跳过操作。"""
         if self.engine.phase == "work":
             self._log_work_segment(done=False)  # 跳过：已运行时间照常计入
         self.engine.skip()
@@ -974,6 +1118,27 @@ class MainWindow(QMainWindow):
         play_state_sound(self.engine.phase, self.chk_sound.isChecked())
         self._sync_rest_overlay(self.engine.phase)
         self._update_timer_display()
+
+    def _show_async_confirm(self, title, text, callback):
+        """弹出非阻塞确认对话框，计时继续运行。
+
+        使用 QMessageBox.open() 实现异步对话框，不阻塞事件循环，
+        用户点击后通过 finished 信号执行回调。
+        """
+        msg_box = QMessageBox(self)
+        msg_box.setWindowTitle(title)
+        msg_box.setText(text)
+        msg_box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        msg_box.setDefaultButton(QMessageBox.No)
+        msg_box.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+        msg_box.setWindowIcon(self.windowIcon())
+
+        def on_finished(result):
+            if result == QMessageBox.Yes:
+                callback()
+
+        msg_box.finished.connect(on_finished)
+        msg_box.open()
 
     def _on_reset(self):
         self.engine.reset()
@@ -1067,14 +1232,26 @@ class MainWindow(QMainWindow):
         if phase == "work":
             self._hide_rest_overlay()
         else:
-            self._show_rest_overlay()
+            self._show_rest_overlay(phase)
             self._enter_rest_compact()  # 休息时自动收起窗口并移右上角
 
-    def _show_rest_overlay(self):
+    def _show_rest_overlay(self, phase="short"):
+        """显示休息遮罩，根据阶段类型创建不同的遮罩内容。
+        
+        Args:
+            phase: "short_break" 短休息 或 "long_break" 长休息
+        """
         if not self.chk_rest_overlay.isChecked():
             return
+        # 如果遮罩已存在但类型不匹配，需要重新创建
+        overlay_type = "long" if phase == "long_break" else "short"
+        if self._overlay is not None:
+            if getattr(self._overlay, '_overlay_type', None) != overlay_type:
+                # 类型不匹配，关闭旧遮罩并重新创建
+                self._overlay.close()
+                self._overlay = None
         if self._overlay is None:
-            self._overlay = RestOverlay()
+            self._overlay = RestOverlay(overlay_type)
         self._overlay.show_overlay()
         # 只有本软件窗口在遮罩上方：主窗口保持可见并压住遮罩
         if not self.isVisible():
@@ -1086,7 +1263,10 @@ class MainWindow(QMainWindow):
         self.raise_()
         self.activateWindow()
         self._avoid_overlay_text()
-        self.log("—— 休息遮罩已显示，请看向6米外物体并眨眼 ——")
+        if overlay_type == "long":
+            self.log("—— 长休息遮罩已显示，请喝水并看向6米外物体 ——")
+        else:
+            self.log("—— 短休息遮罩已显示，请看向6米外物体并眨眼 ——")
 
     def _hide_rest_overlay(self):
         if self._overlay is not None and self._overlay.isVisible():
@@ -1120,7 +1300,7 @@ class MainWindow(QMainWindow):
         self._save_config()
         if checked:
             if self.engine.state != "idle" and self.engine.phase != "work":
-                self._show_rest_overlay()
+                self._show_rest_overlay(self.engine.phase)
         else:
             self._hide_rest_overlay()
 
@@ -1243,9 +1423,7 @@ class MainWindow(QMainWindow):
             return "监管关闭"
         if self._enforcement_active():
             return "监管中"
-        if self.chk_phase_gate.isChecked():
-            return "监管暂停(休息/未开始)"
-        return "监管中"
+        return "监管暂停(休息/未开始)"
 
     def _update_timer_display(self):
         eng = self.engine
@@ -1253,7 +1431,7 @@ class MainWindow(QMainWindow):
         phase = eng.phase
         self.lbl_phase.setText(PHASE_NAMES[phase])
         self.lbl_phase.setStyleSheet(
-            f"font-size: 15px; font-weight: bold; color: {DARK_PHASE_COLORS[phase]};")
+            f"font-size: 20px; font-weight: bold; color: {DARK_PHASE_COLORS[phase]};")
 
         state = STATE_NAMES[eng.state]
         self.lbl_status.setText(
@@ -1298,40 +1476,59 @@ class MainWindow(QMainWindow):
         self._save_config()
 
     def _enforcement_active(self):
-        """当前是否应当执行监管扫描。"""
+        """当前是否应当执行监管扫描（仅工作阶段生效）。"""
         if not self.chk_monitor.isChecked():
             return False
-        if not self.chk_phase_gate.isChecked():
-            return True  # 用户选择始终监管
         eng = self.engine
         return eng.state == "running" and eng.phase == "work"
+
+    def _always_close_active(self):
+        """当前是否应当执行全程应用自动关闭。"""
+        if not self.chk_always_close.isChecked():
+            return False
+        # 全程关闭：全部执行
+        return 1
 
     def _on_scan_tick(self):
         interval = max(0.5, self.spin_interval.value())
         now = time.monotonic()
         if now - self._last_scan >= interval:
             self._last_scan = now
+            # 应用监管扫描
             if self.monitored and self._enforcement_active():
-                self._trigger_scan()
+                self._trigger_scan(self.monitored, force=False, label="监管")
+            # 全程应用自动关闭扫描
+            if self.always_closed and self._always_close_active():
+                self._trigger_scan(self.always_closed, force=False, label="全程关闭")
+        # 工作时段最小化扫描：固定 5 秒间隔（仅工作运行中）
+        if (self.work_minimized and self._minimize_active()
+                and now - self._last_minimize_scan >= MINIMIZE_INTERVAL):
+            self._last_minimize_scan = now
+            self._trigger_minimize_scan()
 
-    def _trigger_scan(self, force=False):
-        """在后台线程执行一次扫描+关闭，避免阻塞界面。"""
+    def _trigger_scan(self, names, force=False, label="监管"):
+        """在后台线程执行一次扫描+关闭，避免阻塞界面。
+
+        Args:
+            names: 要检测关闭的应用名列表
+            force: 是否强制关闭（忽略冷却）
+            label: 日志前缀标识（"监管"或"全程关闭"）
+        """
         if self._scan_busy:
             return  # 上一轮还没结束，跳过本轮，不堆积任务
         self._scan_busy = True
-        threading.Thread(target=self._scan_worker, args=(force,),
+        threading.Thread(target=self._scan_worker, args=(names, force, label),
                          daemon=True).start()
 
-    def _scan_worker(self, force):
+    def _scan_worker(self, names, force, label):
         """后台线程：批量检测 -> 逐个关闭 -> 日志经队列回写主线程。"""
         try:
-            names = list(self.monitored)
             if not names:
                 return
             try:
                 running = self.pm.find_running(names)
             except Exception as exc:
-                self._ui_log(f"! 检测失败: {exc}")
+                self._ui_log(f"! {label}检测失败: {exc}")
                 return
             now = time.monotonic()
             for exe in running:
@@ -1342,16 +1539,16 @@ class MainWindow(QMainWindow):
                 if ok:
                     self._fail_cooldown.pop(exe, None)
                     self._fail_msg.pop(exe, None)
-                    self._ui_log(f"✂ {time.strftime('%H:%M:%S')} 已强制关闭 {exe}（{detail}）")
+                    self._ui_log(f"✂ {time.strftime('%H:%M:%S')} [{label}] 已强制关闭 {exe}（{detail}）")
                     if force:
                         break
                 else:
                     if detail == self._fail_msg.get(exe):
                         self._fail_cooldown[exe] = time.monotonic() + 60
-                        self._ui_log(f"! 关闭 {exe} 失败: {detail}；同一错误 60 秒内不再重试")
+                        self._ui_log(f"! [{label}] 关闭 {exe} 失败: {detail}；同一错误 60 秒内不再重试")
                     else:
                         self._fail_msg[exe] = detail
-                        msg = f"! 关闭 {exe} 失败: {detail}"
+                        msg = f"! [{label}] 关闭 {exe} 失败: {detail}"
                         low = detail.lower()
                         if "权限" in detail or "denied" in low or "拒绝" in detail:
                             msg += "；目标可能以管理员权限运行或受反作弊保护，建议以管理员身份运行本程序"
@@ -1394,6 +1591,121 @@ class MainWindow(QMainWindow):
         self.log("已清空监管列表")
         self._save_config()
 
+    # ============================ 全程应用自动关闭 ============================
+    def _toggle_always_close(self):
+        self.log("全程应用自动关闭已启用" if self.chk_always_close.isChecked() else "全程应用自动关闭已关闭")
+        self._save_config()
+
+    def _add_always_app(self):
+        name = self.edit_always_app.text().strip()
+        if not name:
+            return
+        exe = normalize_exe(name)
+        if exe in self.always_closed:
+            self.log(f"{exe} 已在全程关闭列表中")
+            self.edit_always_app.clear()
+            return
+        self.always_closed.append(exe)
+        self.list_always_apps.addItem(exe)
+        self.edit_always_app.clear()
+        self.log(f"已加入全程关闭: {exe}")
+        self._save_config()
+
+    def _remove_always_app(self):
+        for item in reversed(self.list_always_apps.selectedItems()):
+            exe = item.text()
+            row = self.list_always_apps.row(item)
+            self.list_always_apps.takeItem(row)
+            if exe in self.always_closed:
+                self.always_closed.remove(exe)
+            self._fail_cooldown.pop(exe, None)
+            self._fail_msg.pop(exe, None)
+        self.log("已删除选中的全程关闭项")
+        self._save_config()
+
+    def _clear_always_apps(self):
+        self.always_closed.clear()
+        self.list_always_apps.clear()
+        self._fail_cooldown.clear()
+        self._fail_msg.clear()
+        self.log("已清空全程关闭列表")
+        self._save_config()
+
+    # ============================ 工作时段最小化应用 ============================
+    def _minimize_active(self):
+        """当前是否应当执行工作时段最小化（仅工作计时运行中，非暂停）。"""
+        if not self.chk_minimize.isChecked():
+            return False
+        eng = self.engine
+        return eng.state == "running" and eng.phase == "work"
+
+    def _trigger_minimize_scan(self):
+        """在后台线程执行一次最小化扫描，避免阻塞界面。"""
+        if self._minimize_busy:
+            return  # 上一轮还没结束，跳过本轮
+        self._minimize_busy = True
+        threading.Thread(target=self._minimize_worker, daemon=True).start()
+
+    def _minimize_worker(self):
+        """后台线程：枚举目标窗口 -> 最小化未最小化的 -> 日志经队列回写主线程。
+
+        逻辑与 MinimizeWindowByProcessNameInsteadOfWindowTitle.py 一致：
+        进程名命中目标后，仅对未最小化(IsIconic=False)的窗口执行最小化。
+        """
+        try:
+            if not self._minimizer.available:
+                return
+            try:
+                result = self._minimizer.minimize(self.work_minimized)
+            except Exception as exc:
+                self._ui_log(f"! [工作最小化] 扫描失败: {exc}")
+                return
+            if result["total"]:
+                msg = (f"— {time.strftime('%H:%M:%S')} [工作最小化] 共找到 "
+                       f"{result['total']} 个窗口，已最小化 {result['minimized']} 个，"
+                       f"{result['skipped']} 个原本已处于最小化状态")
+                if result["failed"]:
+                    msg += f"，{result['failed']} 个操作失败"
+                self._ui_log(msg)
+        finally:
+            self._minimize_busy = False
+
+    def _toggle_minimize(self):
+        self.log("工作时段最小化已启用" if self.chk_minimize.isChecked()
+                 else "工作时段最小化已关闭")
+        self._save_config()
+
+    def _add_minimize_app(self):
+        name = self.edit_minimize_app.text().strip()
+        if not name:
+            return
+        exe = normalize_exe(name)
+        if exe in self.work_minimized:
+            self.log(f"{exe} 已在工作最小化列表中")
+            self.edit_minimize_app.clear()
+            return
+        self.work_minimized.append(exe)
+        self.list_minimize_apps.addItem(exe)
+        self.edit_minimize_app.clear()
+        self.log(f"已加入工作最小化: {exe}")
+        self._save_config()
+
+    def _remove_minimize_app(self):
+        for item in reversed(self.list_minimize_apps.selectedItems()):
+            exe = item.text()
+            row = self.list_minimize_apps.row(item)
+            self.list_minimize_apps.takeItem(row)
+            if exe in self.work_minimized:
+                self.work_minimized.remove(exe)
+        self.log("已删除选中的工作最小化项")
+        self._save_config()
+
+    def _clear_minimize_apps(self):
+        self.work_minimized.clear()
+        self.list_minimize_apps.clear()
+        self.log("已清空工作最小化列表")
+        self._save_config()
+
     # ============================ 设置持久化 ==============================
     def _load_config_to_ui(self):
         cfg = self.cfg
@@ -1409,7 +1721,8 @@ class MainWindow(QMainWindow):
             pass
         self.spin_interval.setValue(cfg.get("interval", 2.0))
         self.chk_monitor.setChecked(cfg.get("monitor_enabled", True))
-        self.chk_phase_gate.setChecked(cfg.get("phase_gate", True))
+        self.chk_always_close.setChecked(cfg.get("always_close_enabled", False))
+        self.chk_minimize.setChecked(cfg.get("minimize_enabled", False))
         self.chk_force_break.setChecked(cfg.get("force_on_break", False))
         self.chk_autostart.setChecked(cfg.get("autostart", True))
         self.chk_topmost.setChecked(cfg.get("topmost", False))
@@ -1427,6 +1740,20 @@ class MainWindow(QMainWindow):
                 self.list_apps.addItem(exe)
         if self.monitored:
             self.log(f"已从设置文件加载 {len(self.monitored)} 个监管目标")
+        for exe in cfg.get("always_closed", []):
+            exe = normalize_exe(exe)
+            if exe not in self.always_closed:
+                self.always_closed.append(exe)
+                self.list_always_apps.addItem(exe)
+        if self.always_closed:
+            self.log(f"已从设置文件加载 {len(self.always_closed)} 个全程关闭目标")
+        for exe in cfg.get("work_minimized", []):
+            exe = normalize_exe(exe)
+            if exe not in self.work_minimized:
+                self.work_minimized.append(exe)
+                self.list_minimize_apps.addItem(exe)
+        if self.work_minimized:
+            self.log(f"已从设置文件加载 {len(self.work_minimized)} 个工作最小化目标")
         self._update_timer_display()
 
     def _save_config(self):
@@ -1438,9 +1765,12 @@ class MainWindow(QMainWindow):
                 "cycles": self.spin_cycles.value(),
             },
             "monitored": list(self.monitored),
+            "always_closed": list(self.always_closed),
+            "work_minimized": list(self.work_minimized),
             "interval": self.spin_interval.value(),
             "monitor_enabled": self.chk_monitor.isChecked(),
-            "phase_gate": self.chk_phase_gate.isChecked(),
+            "always_close_enabled": self.chk_always_close.isChecked(),
+            "minimize_enabled": self.chk_minimize.isChecked(),
             "force_on_break": self.chk_force_break.isChecked(),
             "autostart": self.chk_autostart.isChecked(),
             "topmost": self.chk_topmost.isChecked(),
@@ -1503,6 +1833,17 @@ class MainWindow(QMainWindow):
 
     def _quit_app(self):
         """真正退出程序（托盘菜单专用）。"""
+        # 二次确认提示（强制置顶，确保在最前显示）
+        msg_box = QMessageBox()
+        msg_box.setWindowTitle("退出确认")
+        msg_box.setText("确定要退出番茄钟·应用监管吗？")
+        msg_box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        msg_box.setDefaultButton(QMessageBox.No)
+        msg_box.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+        msg_box.setWindowIcon(self.windowIcon())
+        reply = msg_box.exec()
+        if reply != QMessageBox.Yes:
+            return
         self._hide_rest_overlay()
         if self._presence is not None:
             self._presence.stop()  # 释放摄像头并停止检测线程

@@ -22,6 +22,10 @@ rem ---- verify build dependencies ----
 where python >nul 2>&1 || (echo [ERROR] python not found. Install Python and add it to PATH. & goto :err)
 python -c "import PySide6" >nul 2>&1 || (echo [ERROR] PySide6 not found. Run: pip install PySide6 & goto :err)
 python -c "import PyInstaller" >nul 2>&1 || (echo [ERROR] PyInstaller not found. Run: pip install pyinstaller & goto :err)
+python -c "import win32gui" >nul 2>&1 || (
+    echo [WARN] pywin32 not found. "工作时段最小化应用" feature will be disabled in the built exe.
+    echo        Run: pip install pywin32
+)
 if not exist "%~dp0face_detection_yunet_2023mar.onnx" (
     echo [WARN] face_detection_yunet_2023mar.onnx not found.
     echo        Camera presence detection will be degraded in the built exe.

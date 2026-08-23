@@ -4,6 +4,10 @@ PySide6>=6.5
 # 可选：装上后用更高效的进程检测；不装会自动回退到 PowerShell/tasklist
 psutil>=5.9
 
+# 工作时段最小化应用（可选）：依赖 pywin32（win32gui/win32con/win32process）枚举并最小化窗口；
+# 不装时仅该项功能自动降级为不可用，其余功能不受影响
+pywin32>=306
+
 # 摄像头在场检测（离开自动暂停/休息无人关遮罩）：
 # 不装时该功能整体降级为不可用，其余功能不受影响；
 # 模型文件 face_detection_yunet_2023mar.onnx（人脸）
