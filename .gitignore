@@ -18,6 +18,8 @@ env/
 *.swo
 
 # Windows 文件
+build/
+dist/
 Thumbs.db
 Desktop.ini
 
