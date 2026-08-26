@@ -167,6 +167,8 @@ class TrayIcon(QSystemTrayIcon):
 
     def _quit_app(self):
         """真正退出程序（托盘菜单专用）。"""
+        # 先关闭全屏遮罩（检查点/重启/休息），防止遮罩挡住退出确认框
+        self._main_window.dismiss_overlays()
         # 二次确认提示
         msg_box = QMessageBox(self._main_window)
         msg_box.setWindowTitle("退出确认")

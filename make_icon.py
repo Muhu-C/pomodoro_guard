@@ -3,13 +3,16 @@
 import os, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from PySide6.QtGui import QPixmap
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QIcon, QPixmap
 from PySide6.QtWidgets import QApplication
 
-import pomodoro_guard as pg
+from gui.tray_icon import make_tray_icon_pixmap
 
 app = QApplication([])
-pm = pg.make_tray_icon().pixmap(256, 256)
+# 以 256x256 渲染，平滑放大绘制的 64x64 番茄图标
+pm = make_tray_icon_pixmap()
+pm = pm.scaled(256, 256, Qt.KeepAspectRatio, Qt.SmoothTransformation)
 out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.ico")
 if pm.save(out):
     print(f"icon saved: {out}")

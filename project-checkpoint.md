@@ -23,7 +23,7 @@
 
 | 文件 | 行数 | 职责 |
 |---|---|---|
-| `core/engine.py` | ~85 | 番茄钟状态机（work/short_break/long_break/stopped、monotonic 防漂移）；不含"是否自动开始"等策略判断，由控制器判断并调用 |
+| `core/engine.py` | ~120 | 番茄钟状态机（work/short_break/long_break/stopped、monotonic 防漂移）；**特殊阶段 restart**（遮罩 60s → 工作 300s 串联）；不含"是否自动开始"等策略判断，由控制器判断并调用 |
 | `core/config.py` | ~60 | `ConfigManager`：get/set/save/reload，`threading.RLock` 线程安全，`set()` 即时写盘；旧 `load_config`/`save_config` 保留向后兼容 |
 | `core/presence.py` | ~255 | 摄像头人像在场检测（人脸 + 人体组合，后台线程），只上报"人在/不在 + 连续不在时长"，**不做任何暂停/遮罩决策** |
 | `core/guards.py` | ~230 | `GuardianService`：三个独立扫描器（WorkGuard 工作监管 / AlwaysGuard 全程关闭 / MinimizeGuard 工作最小化），各自独立 QThread + QTimer 自驱 |
@@ -38,20 +38,22 @@
 - `force_scan`（进入休息强制清场）绕过启用开关与 60s 失败冷却
 - 每个扫描器有独立失败冷却字典；统一 `log_emitted(str)` 信号由控制器转发给 GUI
 
-### 2.2 总控制器 `controller.py`（~545 行，业务规则枢纽）
+### 2.2 总控制器 `controller.py`（~700 行，业务规则枢纽）
 
 - **职责**：GUI 的每个用户操作（点击按钮、勾选开关）只调用控制器的一个方法（一行代码）；控制器连接核心信号，内部维护所有 if-else 业务判断。
-- **输出信号**：`tick_updated`（200ms 心跳）、`phase_changed`（阶段切换，GUI 据此播提示音）、`log_appended`（日志）、`overlay_requested`（遮罩请求，GUI 负责创建/销毁遮罩实例）、`stats_changed`（统计页刷新）、`presence_alert`（摄像头降级提示）。
-- **公开方法**：计时（start_timer/pause_timer/resume_timer/skip_stage/reset_timer/apply_timer_settings）、监管三开关（toggle_guard/toggle_always_close/toggle_minimize）、三份列表增删清（add/remove/clear monitored/always/minimize apps）、通用 `update_setting(key, value)`、`toggle_presence`/`toggle_rest_overlay`、`clear_stats`、`on_quit`；查询：`monitor_status_text`/`presence_status`/`live_focus_extra`/`enforcement_active`/`always_close_active`/`minimize_active`。
-- **内部规则**（从旧 GUI 回调提取）：`_on_tick`（200ms 轮询引擎状态、检测阶段自然结束）、`_on_phase_transition`（阶段切换统一处理：遮罩同步 + 强制清场 + 监管调度）、`_check_presence_rules`（专注离开超宽限→自动暂停；人回来→自动恢复；休息无人超 60s→关遮罩）、`_update_presence`（按状态幂等启停摄像头）、`_sync_overlay`、`_sync_guards_for_state`（按引擎状态+配置启停扫描器）、`_log_work_segment`（工作段落库）。
-- **关键设计**：`_presence_paused` 标记区分"手动暂停"与"离开暂停"（手动暂停不被摄像头自动恢复）；提示音职责分离（控制器只发 `phase_changed`，GUI 按 `sound_enabled` 配置播放）；遮罩请求式架构（控制器不持有遮罩实例）；重置时 `_stop_all_guards` 仅停定时器、程序退出才 `GuardianService.stop_all()` 退出线程。
+- **输出信号**：`tick_updated`（200ms 心跳）、`phase_changed`（阶段切换，GUI 据此播提示音）、`log_appended`（日志）、`overlay_requested`（遮罩请求，GUI 负责创建/销毁遮罩实例）、`stats_changed`（统计页刷新）、`presence_alert`（摄像头降级提示）、**`checkpoint_requested(int)`**（检查点确认遮罩，参数=待确认数量）、**`checkpoint_dismissed()`**（检查点确认结束）、**`restart_overlay_requested(bool)`**（重启 1 分钟遮罩）。
+- **公开方法**：计时（start_timer/pause_timer/resume_timer/skip_stage/reset_timer/apply_timer_settings）、监管三开关（toggle_guard/toggle_always_close/toggle_minimize）、三份列表增删清（add/remove/clear monitored/always/minimize apps）、通用 `update_setting(key, value)`、`toggle_presence`/`toggle_rest_overlay`、**检查点**（`toggle_checkpoints`/`set_checkpoints`/`clear_checkpoints`/`checkpoint_ok`/`checkpoint_sos`/`is_checkpoint_active`/`checkpoint_remaining_sec`）、`clear_stats`、`on_quit`；查询：`monitor_status_text`/`presence_status`/`live_focus_extra`/`enforcement_active`/`always_close_active`/`minimize_active`。
+- **内部规则**（从旧 GUI 回调提取）：`_on_tick`（200ms 轮询引擎状态、检测阶段自然结束、检查点触发判定与超时、重启流程推进）、`_on_phase_transition`（阶段切换统一处理：遮罩同步 + 强制清场 + 监管调度）、`_check_presence_rules`（专注离开超宽限→自动暂停；人回来→自动恢复；休息无人超 60s→关遮罩）、`_update_presence`（按状态幂等启停摄像头）、`_sync_overlay`、`_sync_guards_for_state`（按引擎状态+配置启停扫描器，重启工作期视同工作）、`_log_work_segment`（工作段落库）、**`_check_checkpoint_trigger`/`_trigger_checkpoint`**（检查点到点/补触发、冻结、遮罩让位）、**`_log_restart_work_segment`**（重启工作段落库，计统计不计 streak）。
+- **关键设计**：`_presence_paused` 标记区分"手动暂停"与"离开暂停"（手动暂停不被摄像头自动恢复）；提示音职责分离（控制器只发 `phase_changed`，GUI 按 `sound_enabled` 配置播放）；遮罩请求式架构（控制器不持有遮罩实例）；检查点确认期间**计时完全冻结**（记录冻结前状态，恢复时还原）、暂停监管/最小化、摄像头暂停；同一检查点当天只触发一次（触发记录仅内存，配置文件只存时间表）。
 
 ### 2.3 界面层 `gui/`（只做显示与交互，不含业务判断）
 
 | 文件 | 行数 | 职责 |
 |---|---|---|
-| `gui/main_window.py` | ~825 | 主窗口：布局、控件、信号绑定、深色主题/云母、收起/展开双模式、设置区滚动；内部自建系统托盘 |
+| `gui/main_window.py` | ~950 | 主窗口：布局、控件、信号绑定、深色主题/云母、收起/展开双模式、设置区滚动、检查点配置 UI、检查点/重启遮罩管理；内部自建系统托盘 |
 | `gui/overlay.py` | ~90 | 休息全屏遮罩（短/长不同文本、多屏联合几何、鼠标/键盘事件拦截） |
+| `gui/checkpoint_overlay.py` | ~120 | 检查点确认全屏遮罩（极简：确认文本 + 「在状态」/「不在状态(SOS)」按钮 + 合并时待确认数量；10 分钟倒计时显示在主窗口上） |
+| `gui/restart_overlay.py` | ~85 | 重启 1 分钟遮罩（固定文案「不要为了无长远意义的事情折磨自己，你还有时间」，固定时长不受影响） |
 | `gui/tray_icon.py` | ~190 | 系统托盘（QPainter 自绘番茄图标、左键显隐、右键状态菜单、tooltip） |
 | `gui/widgets.py` | ~235 | 自绘柱状图 BarChart、统计面板 StatsPanel（四档+streak+清除）、format_duration |
 | `gui/theme.py` | ~250 | 深色 QSS 与云母变体、阶段配色 DARK_PHASE_COLORS、supports_mica/apply_mica、内存合成提示音 play_state_sound、尺寸常量 |
@@ -121,6 +123,15 @@
 - [x] 同 PID 自身窗口跳过（主窗口/休息遮罩不受影响）
 - [x] 独立 `_minimize_busy` 线程标记、日志标识 `[工作最小化]`（仅命中时记录防刷屏）
 - [x] 启用开关与列表均持久化；pywin32/psutil 缺失自动降级
+
+**每日检查点（状态确认）**
+- [x] 配置：每天固定一组 "HH:MM" 检查点（精确到分钟），可增删改清空；配置文件仅存时间表（`checkpoints` / `checkpoints_enabled`）
+- [x] 触发：到点后任何状态（工作/休息/暂停/未开始）均强制触发；软件未打开时错过则打开后补触发，≥2 个合并为一次确认（显示"今日有 N 个检查点待确认"）
+- [x] 确认界面：全屏置顶遮罩（极简文本 + 「在状态」/「不在状态(SOS)」按钮）；主窗口阶段名变红色"检查点"并显示 10 分钟倒计时（超时默认"在状态"）
+- [x] 「在状态」→ 完全恢复检查点之前的状态（工作/休息继续剩余、暂停/未开始保持）；休息遮罩让位且恢复后不重开
+- [x] 「不在状态(SOS)」→ 进入「重启」阶段（与工作/休息同级别）：1 分钟遮罩（固定文案，不受影响）→ 5 分钟固定工作（计统计不计周期/streak，监管/最小化照常生效）→ 短休息 → 正常番茄钟（周期计数归零）
+- [x] 检查点期间计时完全冻结；应用监管/最小化暂停；摄像头暂停（恢复后按状态重启）；重启期间不触发新检查点；同一天同一检查点只确认一次（触发记录仅内存）
+- [x] 被打断的工作段已运行时间照常落库（同"跳过"语义，不影响 streak）
 
 **界面与系统**
 - [x] 深色主题（全控件显式配色）

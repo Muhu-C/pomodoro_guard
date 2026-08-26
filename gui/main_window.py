@@ -16,10 +16,12 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QDoubleSpinBox, QGroupBo
                                QHBoxLayout, QLabel, QLineEdit, QListWidget,
                                QMainWindow, QMessageBox, QPlainTextEdit,
                                QPushButton, QScrollArea, QSpinBox, QTabWidget,
-                               QVBoxLayout, QWidget)
+                               QTimeEdit, QVBoxLayout, QWidget)
 
 from core.utils import PHASE_NAMES, normalize_exe
+from gui.checkpoint_overlay import CheckpointOverlay
 from gui.overlay import RestOverlay
+from gui.restart_overlay import RestartOverlay
 from gui.theme import (COMPACT_H, COMPACT_W, DARK_PHASE_COLORS, EXPANDED_MIN_H,
                        EXPANDED_MIN_W, QSS, QSS_MICA, TOP_RIGHT_MARGIN,
                        apply_mica, play_state_sound, supports_mica)
@@ -58,7 +60,9 @@ class MainWindow(QMainWindow):
         self._mica_applied = False
         self._mica_logged = False
         self._overlay = None
-        self._topmost_forced = False
+        self._checkpoint_overlay = None
+        self._restart_overlay = None
+        self._topmost_forced = 0   # 置顶强制计数器（多个遮罩可叠加；>0 即强制主窗口置顶）
         self._compact = False
         self._expanded_size = None
 
@@ -71,6 +75,10 @@ class MainWindow(QMainWindow):
         self._ctrl.log_appended.connect(self._append_log)
         self._ctrl.overlay_requested.connect(self._handle_overlay_request)
         self._ctrl.presence_alert.connect(self._show_presence_alert)
+        self._ctrl.checkpoint_requested.connect(self._on_checkpoint_requested)
+        self._ctrl.checkpoint_dismissed.connect(self._on_checkpoint_dismissed)
+        self._ctrl.restart_overlay_requested.connect(
+            self._on_restart_overlay_requested)
 
         # 系统托盘
         self._tray = TrayIcon(self._ctrl, self, self)
@@ -175,6 +183,7 @@ class MainWindow(QMainWindow):
         self._build_monitor_settings()
         self._build_always_close_settings()
         self._build_minimize_settings()
+        self._build_checkpoint_settings()
         self._build_log_area()
 
         self.tabs.addTab(self.tab_settings, "设置·监管")
@@ -393,6 +402,55 @@ class MainWindow(QMainWindow):
         v3.addWidget(self.list_minimize_apps)
         self.scroll_layout.addWidget(grp)
 
+    def _build_checkpoint_settings(self):
+        """每日检查点（状态确认）分组。"""
+        grp = QGroupBox("每日检查点（状态确认）")
+        v4 = QVBoxLayout(grp)
+        v4.setSpacing(8)
+
+        crow1 = QHBoxLayout()
+        self.chk_checkpoints = QCheckBox("启用每日检查点")
+        self.chk_checkpoints.setChecked(False)
+        self.chk_checkpoints.toggled.connect(self._ctrl.toggle_checkpoints)
+        crow1.addWidget(self.chk_checkpoints)
+        crow1.addStretch(1)
+        v4.addLayout(crow1)
+
+        crow2 = QHBoxLayout()
+        lbl_hint = QLabel(
+            "到点后无论番茄钟处于什么状态都会弹出确认：\n"
+            "· 在状态 → 恢复正常（检查点之前的状态）\n"
+            "· 不在状态(SOS) → 重启流程：1 分钟遮罩 → 5 分钟工作 → 短休息 → 正常番茄钟\n"
+            "确认期间番茄钟冻结，主窗口显示检查点倒计时（10 分钟超时默认视为在状态）；\n"
+            "软件未打开时错过的检查点，下次打开时补触发（多个合并为一次确认）。")
+        lbl_hint.setStyleSheet("color: #9d9d9d; font-size: 11px;")
+        lbl_hint.setWordWrap(True)
+        crow2.addWidget(lbl_hint)
+        crow2.addStretch(1)
+        v4.addLayout(crow2)
+
+        crow3 = QHBoxLayout()
+        self.time_checkpoint = QTimeEdit()
+        self.time_checkpoint.setDisplayFormat("HH:mm")
+        self.time_checkpoint.setTime(self.time_checkpoint.time().fromString("09:00", "HH:mm"))
+        crow3.addWidget(self._lbl("时间"), 0)
+        crow3.addWidget(self.time_checkpoint, 1)
+        self.btn_add_checkpoint = QPushButton("添加")
+        self.btn_del_checkpoint = QPushButton("删除选中")
+        self.btn_clear_checkpoints = QPushButton("清空")
+        self.btn_add_checkpoint.clicked.connect(self._add_checkpoint)
+        self.btn_del_checkpoint.clicked.connect(self._remove_checkpoints)
+        self.btn_clear_checkpoints.clicked.connect(self._clear_checkpoints)
+        crow3.addWidget(self.btn_add_checkpoint)
+        crow3.addWidget(self.btn_del_checkpoint)
+        crow3.addWidget(self.btn_clear_checkpoints)
+        v4.addLayout(crow3)
+
+        self.list_checkpoints = QListWidget()
+        self.list_checkpoints.setMaximumHeight(100)
+        v4.addWidget(self.list_checkpoints)
+        self.scroll_layout.addWidget(grp)
+
     def _build_log_area(self):
         """日志分组。"""
         grp = QGroupBox("日志")
@@ -477,7 +535,7 @@ class MainWindow(QMainWindow):
 
     def _on_topmost_toggled(self, checked):
         """窗口总在最前勾选。"""
-        if self._topmost_forced:
+        if self._topmost_forced > 0:
             self._ctrl.update_setting("topmost", checked)
             return
         self.setWindowFlag(Qt.WindowStaysOnTopHint, checked)
@@ -538,8 +596,38 @@ class MainWindow(QMainWindow):
         for item in reversed(items):
             self.list_minimize_apps.takeItem(self.list_minimize_apps.row(item))
 
+    def _add_checkpoint(self):
+        """添加检查点时间（HH:MM）。"""
+        hm = self.time_checkpoint.time().toString("HH:mm")
+        existing = [self.list_checkpoints.item(i).text()
+                    for i in range(self.list_checkpoints.count())]
+        if hm in existing:
+            return
+        self.list_checkpoints.addItem(hm)
+        self._sync_checkpoints_config()
+
+    def _remove_checkpoints(self):
+        items = list(self.list_checkpoints.selectedItems())
+        if not items:
+            return
+        for item in reversed(items):
+            self.list_checkpoints.takeItem(self.list_checkpoints.row(item))
+        self._sync_checkpoints_config()
+
+    def _sync_checkpoints_config(self):
+        """把列表控件内容同步到配置（即时写盘）。"""
+        times = [self.list_checkpoints.item(i).text()
+                 for i in range(self.list_checkpoints.count())]
+        self._ctrl.set_checkpoints(times)
+
+    def _clear_checkpoints(self):
+        """清空检查点列表（控件 + 配置）。"""
+        self.list_checkpoints.clear()
+        self._ctrl.clear_checkpoints()
+
     def _relaunch_admin(self):
         """以管理员身份重启。"""
+        self.dismiss_overlays()  # 先关闭全屏遮罩，防止挡住确认框
         if QMessageBox.question(
                 self, "以管理员身份重启",
                 "将关闭当前窗口并触发 UAC 提权重启。\n"
@@ -572,6 +660,19 @@ class MainWindow(QMainWindow):
     def _update_display(self):
         """更新倒计时、状态栏、按钮状态。"""
         ctrl = self._ctrl
+
+        # 检查点确认中：主窗口显示红色"检查点" + 检查点倒计时
+        if ctrl.is_checkpoint_active():
+            self.lbl_phase.setText("检查点")
+            self.lbl_phase.setStyleSheet(
+                "font-size: 20px; font-weight: bold; color: #ff6b6b;")
+            self.lbl_time.setText(self._fmt_secs(ctrl.checkpoint_remaining_sec()))
+            self.lbl_status.setText(
+                f"检查点确认中（{ctrl.checkpoint_remaining_sec():.0f} 秒后超时视为在状态）")
+            self.btn_start.setEnabled(False)
+            self.btn_pause.setEnabled(False)
+            return
+
         self.lbl_time.setText(self._fmt_remaining())
         phase = ctrl.engine_phase()
         self.lbl_phase.setText(PHASE_NAMES[phase])
@@ -586,6 +687,13 @@ class MainWindow(QMainWindow):
         self.btn_start.setEnabled(ctrl.engine_state() == "idle")
         self.btn_pause.setEnabled(ctrl.engine_state() != "idle")
         self.btn_pause.setText("继续" if ctrl.engine_state() == "paused" else "暂停")
+
+    @staticmethod
+    def _fmt_secs(seconds):
+        """秒数 → "MM:SS"（向上取整）。"""
+        remaining = int(seconds + 0.999)
+        mm, ss = divmod(remaining, 60)
+        return f"{mm:02d}:{ss:02d}"
 
     def _on_phase_changed(self, new_phase):
         """阶段切换时播放提示音。"""
@@ -604,6 +712,57 @@ class MainWindow(QMainWindow):
             self._show_overlay(overlay_type)
         else:
             self._hide_overlay()
+
+    # =====================================================================
+    #  检查点 / 重启遮罩
+    # =====================================================================
+
+    def _on_checkpoint_requested(self, pending_count):
+        """检查点确认遮罩：全屏显示，主窗口悬浮其上（展示倒计时）。"""
+        if self._checkpoint_overlay is not None:
+            self._checkpoint_overlay.deleteLater()  # 销毁旧遮罩（closeEvent 忽略 close，须 deleteLater）
+            self._checkpoint_overlay = None
+        self._checkpoint_overlay = CheckpointOverlay(self._ctrl, pending_count)
+        self._checkpoint_overlay.show_overlay()
+        # 主窗口悬浮在检查点遮罩上方（便于查看倒计时）
+        if not self.isVisible():
+            self.showNormal()
+        self._force_topmost()
+        self.raise_()
+        self.activateWindow()
+
+    def _on_checkpoint_dismissed(self):
+        """检查点确认结束：关闭确认遮罩，恢复主窗口置顶状态。"""
+        if self._checkpoint_overlay is not None:
+            self._checkpoint_overlay.hide()
+            self._checkpoint_overlay.deleteLater()
+            self._checkpoint_overlay = None
+        self._release_topmost()
+        self._update_display()
+
+    def _on_restart_overlay_requested(self, show):
+        """重启 1 分钟遮罩显示/隐藏。"""
+        if show:
+            if self._restart_overlay is None:
+                self._restart_overlay = RestartOverlay()
+            self._restart_overlay.show_overlay()
+            if not self.isVisible():
+                self.showNormal()
+            self._force_topmost()
+            self.raise_()
+            self.activateWindow()
+            self._set_compact_mode(True, move_corner=True)
+            self._append_log("重启模式：窗口已收起至右上角")
+        else:
+            if self._restart_overlay is not None and self._restart_overlay.isVisible():
+                self._restart_overlay.hide()
+            self._release_topmost()
+
+    def dismiss_overlays(self):
+        """退出/提权前统一关闭所有全屏遮罩（检查点/重启/休息），防止遮罩挡住退出确认。"""
+        self._on_checkpoint_dismissed()
+        self._on_restart_overlay_requested(False)
+        self._hide_overlay()
 
     def _show_presence_alert(self, message):
         """显示摄像头降级提示。"""
@@ -662,23 +821,35 @@ class MainWindow(QMainWindow):
     #  休息遮罩
     # =====================================================================
 
+    def _force_topmost(self):
+        """强制主窗口置顶（计数：检查点/重启/休息遮罩可叠加，各自释放互不干扰）。"""
+        self._topmost_forced += 1
+        if not self.chk_topmost.isChecked():
+            self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+            self.show()
+
+    def _release_topmost(self):
+        """释放一次置顶强制；计数归零且用户未勾选"总在最前"时恢复原置顶状态。"""
+        if self._topmost_forced > 0:
+            self._topmost_forced -= 1
+            if self._topmost_forced == 0 and not self.chk_topmost.isChecked():
+                self.setWindowFlag(Qt.WindowStaysOnTopHint, False)
+                self.show()
+
     def _show_overlay(self, overlay_type):
         """显示休息遮罩。"""
         if not self.chk_rest_overlay.isChecked():
             return
         if self._overlay is not None:
             if getattr(self._overlay, '_overlay_type', None) != overlay_type:
-                self._overlay.close()
+                self._overlay.deleteLater()  # 销毁旧类型遮罩（closeEvent 忽略 close，须 deleteLater）
                 self._overlay = None
         if self._overlay is None:
             self._overlay = RestOverlay(overlay_type)
         self._overlay.show_overlay()
         if not self.isVisible():
             self.showNormal()
-        if not self.chk_topmost.isChecked():
-            self._topmost_forced = True
-            self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
-            self.show()
+        self._force_topmost()
         self.raise_()
         self.activateWindow()
         self._avoid_overlay_text()
@@ -690,10 +861,7 @@ class MainWindow(QMainWindow):
         """隐藏休息遮罩。"""
         if self._overlay is not None and self._overlay.isVisible():
             self._overlay.hide()
-        if self._topmost_forced:
-            self._topmost_forced = False
-            self.setWindowFlag(Qt.WindowStaysOnTopHint, self.chk_topmost.isChecked())
-            self.show()
+        self._release_topmost()
 
     def _avoid_overlay_text(self):
         """主窗口避免遮挡遮罩文本。"""
@@ -761,7 +929,8 @@ class MainWindow(QMainWindow):
                    self.spin_cycles, self.spin_interval, self.spin_presence_grace,
                    self.chk_monitor, self.chk_always_close, self.chk_minimize,
                    self.chk_force_break, self.chk_autostart, self.chk_topmost,
-                   self.chk_sound, self.chk_rest_overlay, self.chk_presence)
+                   self.chk_sound, self.chk_rest_overlay, self.chk_presence,
+                   self.chk_checkpoints)
         for w in widgets:
             w.blockSignals(True)
         try:
@@ -783,6 +952,8 @@ class MainWindow(QMainWindow):
             self.chk_sound.setChecked(_bool(cfg.get("sound_enabled"), True))
             self.chk_rest_overlay.setChecked(_bool(cfg.get("rest_overlay"), True))
             self.chk_presence.setChecked(_bool(cfg.get("presence_enabled"), True))
+            self.chk_checkpoints.setChecked(
+                _bool(cfg.get("checkpoints_enabled"), False))
             self.spin_presence_grace.setValue(
                 _num(cfg.get("presence_grace_sec"), 15.0))
         finally:
@@ -806,6 +977,12 @@ class MainWindow(QMainWindow):
             self.list_minimize_apps.addItem(exe)
         if minimized:
             self._append_log(f"已从设置文件加载 {len(minimized)} 个工作最小化目标")
+        checkpoints = _list(cfg.get("checkpoints"))
+        for hm in checkpoints:
+            if hm and self._ctrl._valid_checkpoint_time(hm):
+                self.list_checkpoints.addItem(hm)
+        if checkpoints:
+            self._append_log(f"已从设置文件加载 {len(checkpoints)} 个检查点")
         self._update_display()
 
     def _save_timer_config(self):
@@ -850,7 +1027,7 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(600, self._restore_topmost)
 
     def _restore_topmost(self):
-        want = self._topmost_forced or self.chk_topmost.isChecked()
+        want = (self._topmost_forced > 0) or self.chk_topmost.isChecked()
         self.setWindowFlag(Qt.WindowStaysOnTopHint, want)
         self.show()
 

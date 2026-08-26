@@ -15,8 +15,10 @@ except ImportError:  # psutil 未安装时使用 tasklist / taskkill 回退
     HAS_PSUTIL = False
 
 # 阶段显示名与配色（供界面层展示用）
-PHASE_NAMES = {"work": "工作", "short_break": "短休息", "long_break": "长休息"}
-PHASE_COLORS = {"work": "#e74c3c", "short_break": "#27ae60", "long_break": "#2980b9"}
+PHASE_NAMES = {"work": "工作", "short_break": "短休息", "long_break": "长休息",
+               "restart": "重启"}
+PHASE_COLORS = {"work": "#e74c3c", "short_break": "#27ae60",
+                "long_break": "#2980b9", "restart": "#f39c12"}
 
 # 不弹出黑窗口
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0

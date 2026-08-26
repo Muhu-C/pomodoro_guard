@@ -51,6 +51,14 @@ def main():
     # 3. 组装 GUI（注入控制器；MainWindow 内部自建系统托盘）
     window = MainWindow(controller)
     window.show()
+    screen = app.primaryScreen()
+    if screen:
+        screen_geom = screen.availableGeometry()      # 可用区域（排除任务栏）
+        window_rect = window.frameGeometry()          # 窗口框架几何（含标题栏）
+        margin = 25                                   # 边距
+        x = screen_geom.right() - window_rect.width() - margin
+        y = screen_geom.top() + margin
+        window.move(x, y)
 
     # lock 在本函数局部保持引用，随 app.exec() 返回后释放
     return app.exec()

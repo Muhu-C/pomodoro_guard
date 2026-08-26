@@ -30,7 +30,7 @@ from PySide6.QtWidgets import QApplication
 
 # 深色主题下更亮的阶段配色
 DARK_PHASE_COLORS = {"work": "#ff6b6b", "short_break": "#2ecc71",
-                     "long_break": "#5dade2"}
+                     "long_break": "#5dade2", "restart": "#f39c12"}
 
 # 主窗口显示模式尺寸
 COMPACT_W, COMPACT_H = 400, 240          # 收起模式尺寸
@@ -200,6 +200,7 @@ _CHIME_FREQS = {
     "work": [587.33, 880.00],          # 上行双音：开始工作
     "short_break": [880.00, 587.33],   # 下行双音：短休息
     "long_break": [523.25, 659.25, 783.99],  # 三连音：长休息
+    "restart": [440.00, 392.00, 440.00],  # 警示三连：重启阶段（SOS）
 }
 
 

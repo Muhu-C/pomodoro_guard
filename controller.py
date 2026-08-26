@@ -7,6 +7,7 @@
 依赖方向：controller → core/*（强依赖）；controller → gui/*（仅类型声明，不实例化）。
 """
 
+import re
 import time
 
 from PySide6.QtCore import QObject, QTimer, Signal
@@ -22,6 +23,9 @@ from core.utils import PHASE_NAMES, normalize_exe
 # 摄像头在场检测：休息阶段人离开超过该秒数则关闭遮罩（固定值，不提供配置）
 REST_AWAY_SECONDS = 60.0
 
+# 检查点确认超时（秒）：10 分钟，超时默认视为"在状态"继续
+CHECKPOINT_TIMEOUT_SEC = 600.0
+
 
 class ApplicationController(QObject):
     """总控制器：持有所有核心对象，集中处理业务规则。
@@ -33,6 +37,9 @@ class ApplicationController(QObject):
     - overlay_requested(bool, str)：请求显示/隐藏休息遮罩（显示=True + 类型；隐藏=False + 空字符串）
     - stats_changed：统计数据变化，GUI 刷新统计面板
     - presence_alert(str)：摄像头不可用降级提示
+    - checkpoint_requested(int)：请求显示检查点确认遮罩（参数=待确认检查点数量）
+    - checkpoint_dismissed()：检查点确认结束（遮罩关闭）
+    - restart_overlay_requested(bool)：请求显示/隐藏"重启"1 分钟遮罩
     """
 
     # ---- 输出信号（通知 GUI 更新） ----
@@ -42,6 +49,9 @@ class ApplicationController(QObject):
     overlay_requested = Signal(bool, str)      # (是否显示, 类型 "short"/"long")
     stats_changed = Signal()                   # 统计页需刷新
     presence_alert = Signal(str)               # 摄像头不可用降级提示
+    checkpoint_requested = Signal(int)         # 检查点确认遮罩（待确认数量）
+    checkpoint_dismissed = Signal()            # 检查点确认遮罩关闭
+    restart_overlay_requested = Signal(bool)   # 重启 1 分钟遮罩显示/隐藏
 
     def __init__(self, config: ConfigManager, engine: PomodoroEngine,
                  presence: PresenceDetector, guards: GuardianService,
@@ -59,6 +69,15 @@ class ApplicationController(QObject):
         self._overlay_type = ""             # 当前遮罩类型 "short" / "long"
         self._presence_err_logged = False   # 摄像头不可用是否已提示（避免刷屏）
         self._presence_running = False      # 摄像头检测当前是否处于"应运行"状态（识别启用边沿）
+
+        # ---- 检查点状态 ----
+        self._checkpoint_active = False     # 检查点确认是否正在进行
+        self._checkpoint_remaining = 0.0    # 检查点确认剩余秒数（10 分钟倒计时）
+        self._checkpoint_pending = 0        # 本次确认覆盖的待确认检查点数量
+        self._checkpoint_frozen_state = ""  # 触发时引擎状态（idle/running/paused），用于恢复
+        self._checkpoint_date = ""          # 当天日期串（跨天重置已触发集合）
+        self._checkpoint_triggered = set()  # 当天已触发的检查点时间（仅内存，不持久化）
+        self._restart_overlay_visible = False  # 重启 1 分钟遮罩是否显示
 
         # 连接监管服务日志信号 → 转发给 GUI
         self._guards.log_emitted.connect(self.log_appended)
@@ -83,6 +102,8 @@ class ApplicationController(QObject):
 
     def start_timer(self):
         """开始计时。"""
+        if self._checkpoint_active:
+            return  # 检查点确认期间冻结，忽略控制操作
         self._engine.start()
         self._presence_paused = False
         self.log_appended.emit(f"开始 {PHASE_NAMES[self._engine.phase]}")
@@ -90,6 +111,8 @@ class ApplicationController(QObject):
 
     def request_pause(self):
         """手动暂停。标记 _presence_paused=False 使摄像头不会自动恢复。"""
+        if self._checkpoint_active:
+            return
         self._engine.pause()
         self._presence_paused = False
         self.log_appended.emit("已暂停")
@@ -97,6 +120,8 @@ class ApplicationController(QObject):
 
     def resume_timer(self):
         """从暂停恢复。"""
+        if self._checkpoint_active:
+            return
         self._engine.resume()
         self._presence_paused = False  # 手动恢复：接管控制权（人不在会再次自动暂停）
         self.log_appended.emit("继续计时")
@@ -104,6 +129,12 @@ class ApplicationController(QObject):
 
     def skip_stage(self):
         """跳过当前阶段。"""
+        if self._checkpoint_active:
+            return
+        if self._engine.phase == "restart":
+            # 重启流程为固定 1+5 分钟，不允许跳过打断（防止误入错误遮罩/状态）
+            self.log_appended.emit("重启流程中不能跳过，请等待重启完成")
+            return
         eng = self._engine
         if eng.state == "idle":
             self.start_timer()
@@ -121,10 +152,13 @@ class ApplicationController(QObject):
         重置后按状态重新调度扫描器：工作监管/工作最小化因引擎回到 idle 而停止；
         全程关闭若处于启用状态则继续运行（与旧版"启用即运行"行为一致）。
         """
+        if self._checkpoint_active:
+            return
         self._engine.reset()
         self._presence_paused = False
         self.log_appended.emit("已重置计时器")
         self._hide_overlay()
+        self._hide_restart_overlay()  # 重置退出重启流程时关闭重启遮罩（若有）
         self._sync_guards_for_state()
 
     def apply_timer_settings(self, work_min, short_min, long_min, cycles):
@@ -272,6 +306,82 @@ class ApplicationController(QObject):
         else:
             self._hide_overlay()
 
+    # ---- 检查点 ---------------------------------------------------------
+
+    @staticmethod
+    def _valid_checkpoint_time(s):
+        """校验 "HH:MM" 格式（24 小时制，分钟级）。"""
+        if not isinstance(s, str):
+            return False
+        m = re.match(r"^(\d{2}):(\d{2})$", s)
+        if not m:
+            return False
+        hh, mm = int(m.group(1)), int(m.group(2))
+        return 0 <= hh <= 23 and 0 <= mm <= 59
+
+    def toggle_checkpoints(self, enabled: bool):
+        """启用/禁用每日检查点。"""
+        self._config.set("checkpoints_enabled", enabled)
+        self.log_appended.emit(
+            "每日检查点已启用" if enabled else "每日检查点已关闭")
+
+    def set_checkpoints(self, times):
+        """保存检查点时间表（仅存 "HH:MM" 字符串列表，写入配置即时生效）。"""
+        cleaned = [t for t in times if self._valid_checkpoint_time(t)]
+        cleaned = sorted(set(cleaned))  # 去重 + 排序
+        self._config.set("checkpoints", cleaned)
+        if cleaned:
+            self.log_appended.emit(
+                f"已保存 {len(cleaned)} 个检查点: {', '.join(cleaned)}")
+        else:
+            self.log_appended.emit("检查点列表已清空")
+
+    def clear_checkpoints(self):
+        """清空检查点列表。"""
+        self._config.set("checkpoints", [])
+        self.log_appended.emit("已清空检查点列表")
+
+    def checkpoint_ok(self):
+        """检查点确认：在状态 → 恢复正常（检查点之前的状态），关闭确认。"""
+        if not self._checkpoint_active:
+            return
+        self._checkpoint_active = False
+        # 恢复之前状态：running → 继续剩余时间；paused/idle → 保持
+        if self._checkpoint_frozen_state == "running":
+            self._engine.resume()
+        self.log_appended.emit("检查点确认：在状态，恢复正常")
+        self.checkpoint_dismissed.emit()
+        self._sync_guards_for_state()
+
+    def checkpoint_sos(self):
+        """检查点确认：不在状态 → 进入「重启」流程（1 分钟遮罩 + 5 分钟工作 + 短休息）。"""
+        if not self._checkpoint_active:
+            return
+        self._checkpoint_active = False
+        eng = self._engine
+        # 当前工作段已运行时间照常落库（类似跳过，不计 streak）
+        if eng.phase == "work" and eng.state in ("running", "paused"):
+            self._log_work_segment(done=False)
+        # 关闭休息遮罩（若有）
+        self._hide_overlay()
+        # 周期计数归零：重启流程结束后从第一个番茄重新开始
+        eng.work_count = 0
+        # 进入重启阶段（遮罩期 1 分钟）
+        eng.enter_restart()
+        self.log_appended.emit("检查点确认：不在状态，进入「重启」阶段（1 分钟遮罩 → 5 分钟工作 → 短休息）")
+        self.phase_changed.emit("restart")
+        self.checkpoint_dismissed.emit()
+        self._show_restart_overlay()
+        self._sync_guards_for_state()
+
+    def is_checkpoint_active(self) -> bool:
+        """检查点确认是否正在进行。"""
+        return self._checkpoint_active
+
+    def checkpoint_remaining_sec(self) -> float:
+        """检查点确认剩余秒数（主窗口倒计时显示用）。"""
+        return max(0.0, self._checkpoint_remaining)
+
     # ---- 统计 -------------------------------------------------------------
 
     def clear_stats(self):
@@ -394,6 +504,8 @@ class ApplicationController(QObject):
         """程序退出前的清理：落库 + 释放摄像头 + 停止扫描器。"""
         self._tick_timer.stop()  # 先停心跳：防止后续 tick 访问已关闭的统计库
         self._hide_overlay()
+        self._hide_restart_overlay()  # 关闭重启遮罩（若有显示）
+        self._checkpoint_active = False  # 终止检查点确认状态
         self._presence.stop()
         self._log_work_segment(done=False)
         self._stats.close()
@@ -404,19 +516,50 @@ class ApplicationController(QObject):
     # =====================================================================
 
     def _on_tick(self):
-        """200ms 定时驱动：检测阶段自然结束 + 摄像头规则 + 发射心跳。"""
+        """200ms 定时驱动：检查点调度 + 阶段推进 + 摄像头规则 + 心跳。"""
         eng = self._engine
+
+        # 0. 检查点确认进行中：倒计时递减，超时默认"在状态"；冻结番茄钟
+        if self._checkpoint_active:
+            self._checkpoint_remaining -= 0.2
+            if self._checkpoint_remaining <= 0:
+                self.log_appended.emit("检查点确认超时（10 分钟），默认视为在状态，恢复正常")
+                self.checkpoint_ok()
+            self.tick_updated.emit()
+            return
+
+        # 0.5 检查点触发判定（到点 / 启动补触发）
+        self._check_checkpoint_trigger()
 
         # 1. 检测阶段自然结束（倒计时归零 → 自动推进）
         if eng.state == "running" and eng.remaining_seconds() <= 0:
-            if eng.phase == "work":
+            if eng.phase == "restart":
+                # 重启流程：遮罩期 → 工作期 → 短休息
+                if eng.restart_stage == "break":
+                    eng.restart_break_done()
+                    self._hide_restart_overlay()
+                    self.log_appended.emit("重启遮罩结束，开始 5 分钟重启工作")
+                    self._sync_guards_for_state()  # 工作期：监管/最小化照常生效
+                else:
+                    self._log_restart_work_segment()  # 计统计，不计 streak
+                    eng.restart_work_done()
+                    self.log_appended.emit("⏰ 重启工作结束，进入短休息")
+                    self._on_phase_transition("short_break", check_autostart=True)
+            elif eng.phase == "work":
                 self._log_work_segment(done=True)  # 自然结束的番茄
-            new_phase, finished_work = eng.advance()
-            msg = f"⏰ {PHASE_NAMES[new_phase]} 开始"
-            if finished_work:
-                msg += f"（已完成{eng.work_count}个番茄）"
-            self.log_appended.emit(msg)
-            self._on_phase_transition(new_phase, check_autostart=True)
+                new_phase, finished_work = eng.advance()
+                msg = f"⏰ {PHASE_NAMES[new_phase]} 开始"
+                if finished_work:
+                    msg += f"（已完成{eng.work_count}个番茄）"
+                self.log_appended.emit(msg)
+                self._on_phase_transition(new_phase, check_autostart=True)
+            else:
+                new_phase, finished_work = eng.advance()
+                msg = f"⏰ {PHASE_NAMES[new_phase]} 开始"
+                if finished_work:
+                    msg += f"（已完成{eng.work_count}个番茄）"
+                self.log_appended.emit(msg)
+                self._on_phase_transition(new_phase, check_autostart=True)
 
         # 2. 摄像头在场检测：按状态调度启停
         self._update_presence()
@@ -481,11 +624,26 @@ class ApplicationController(QObject):
         self._stats.add_work_segment(elapsed, done=done)
         self.stats_changed.emit()
 
+    def _log_restart_work_segment(self):
+        """记录重启工作期（5 分钟）已运行时长到统计库。
+
+        计入专注时长统计，但不计周期计数 / streak（done=False）。
+        """
+        eng = self._engine
+        if eng.phase != "restart" or eng.restart_stage != "work":
+            return
+        elapsed = eng.restart_work_sec - eng.remaining_seconds()
+        self._stats.add_work_segment(elapsed, done=False)
+        self.stats_changed.emit()
+
     # ---- 遮罩控制 ----
 
     def _sync_overlay(self, phase):
-        """按阶段同步遮罩：休息显示，工作隐藏。"""
-        if phase == "work":
+        """按阶段同步休息遮罩：休息显示，工作/重启隐藏。
+
+        restart 阶段不显示休息遮罩（重启遮罩由 restart_overlay_requested 单独管理）。
+        """
+        if phase == "work" or phase == "restart":
             self._hide_overlay()
         else:
             self._show_overlay(phase)
@@ -513,12 +671,79 @@ class ApplicationController(QObject):
             self.overlay_requested.emit(False, "")
             self.log_appended.emit("休息遮罩已关闭")
 
+    # ---- 检查点调度 ----
+
+    def _check_checkpoint_trigger(self):
+        """检查点触发判定：到点即触发；启动时补触发今天已过时间的检查点。
+
+        - 仅当"检查点已启用"且当前没有正在确认的检查点；
+        - 重启流程中不触发新检查点（重启本身就是对"不在状态"的响应）；
+        - 同一检查点当天只触发一次（内存记录，不持久化——配置文件只存时间表）；
+        - 多个未触发的过期检查点合并为一次确认（待确认数量 = 合并数）。
+        """
+        if not self._config.get("checkpoints_enabled", False):
+            return
+        if self._checkpoint_active:
+            return
+        if self._engine.phase == "restart":
+            return  # 重启流程中不打断
+        today = time.strftime("%Y-%m-%d")
+        if today != self._checkpoint_date:
+            self._checkpoint_date = today
+            self._checkpoint_triggered.clear()
+        now_hm = time.strftime("%H:%M")
+        scheduled = [c for c in self._config.get("checkpoints", [])
+                     if self._valid_checkpoint_time(c)]
+        pending = [c for c in scheduled
+                   if c <= now_hm and c not in self._checkpoint_triggered]
+        if pending:
+            for c in pending:
+                self._checkpoint_triggered.add(c)
+            self._trigger_checkpoint(len(pending))
+
+    def _trigger_checkpoint(self, count):
+        """触发检查点确认：冻结番茄钟、休息遮罩让位、暂停监管/最小化、弹确认。"""
+        eng = self._engine
+        # 休息遮罩让位
+        self._hide_overlay()
+        # 冻结计时：记录触发前状态；running → 暂停（剩余时间保留）
+        self._checkpoint_frozen_state = eng.state
+        if eng.state == "running":
+            eng.pause()
+        # 检查点确认期间暂停应用监管与窗口最小化（摄像头也暂停，恢复后按状态重启）
+        self._guards.stop("work")
+        self._guards.stop("minimize")
+        self._presence.disable()
+        # 进入确认状态
+        self._checkpoint_active = True
+        self._checkpoint_remaining = CHECKPOINT_TIMEOUT_SEC
+        self._checkpoint_pending = count
+        self.checkpoint_requested.emit(count)
+        self.log_appended.emit(
+            f"⏰ 检查点时间到：今日 {count} 个检查点待确认"
+            f"（{int(CHECKPOINT_TIMEOUT_SEC // 60)} 分钟内超时自动视为在状态）")
+
+    # ---- 重启遮罩（1 分钟，显示重启文案） ----
+
+    def _show_restart_overlay(self):
+        """请求显示重启遮罩（发射信号给 GUI）。"""
+        self._restart_overlay_visible = True
+        self.restart_overlay_requested.emit(True)
+
+    def _hide_restart_overlay(self):
+        """请求隐藏重启遮罩（发射信号给 GUI）。"""
+        if self._restart_overlay_visible:
+            self._restart_overlay_visible = False
+            self.restart_overlay_requested.emit(False)
+
     # ---- 摄像头在场检测 ----
 
     def _presence_should_run(self) -> bool:
         """当前状态是否需要启用摄像头检测。"""
         if not self._config.get("presence_enabled", True):
             return False
+        if self._checkpoint_active:
+            return False  # 检查点确认期间摄像头不运行（恢复后按状态重新调度）
         eng = self._engine
         if self._overlay_visible:
             return True  # 休息遮罩显示中：人在保持遮罩，离开超时关闭
@@ -586,8 +811,11 @@ class ApplicationController(QObject):
         """根据当前引擎状态与配置，启动 / 停止对应的扫描器。"""
         eng = self._engine
 
-        # 工作监管：仅工作 + 运行中
-        if (eng.state == "running" and eng.phase == "work"
+        # 工作监管：正常"工作 + 运行中" 或 "重启工作期"（检查点确认期间不启动）
+        work_active = (eng.state == "running" and eng.phase == "work") or (
+            eng.state == "running" and eng.phase == "restart"
+            and eng.restart_stage == "work")
+        if (work_active and not self._checkpoint_active
                 and self._config.get("monitor_enabled", True)):
             self._guards.start("work")
         else:
@@ -599,8 +827,8 @@ class ApplicationController(QObject):
         else:
             self._guards.stop("always")
 
-        # 工作最小化：仅工作 + 运行中
-        if (eng.state == "running" and eng.phase == "work"
+        # 工作最小化：正常"工作 + 运行中" 或 "重启工作期"（检查点确认期间不启动）
+        if (work_active and not self._checkpoint_active
                 and self._config.get("minimize_enabled", False)):
             self._guards.start("minimize")
         else:

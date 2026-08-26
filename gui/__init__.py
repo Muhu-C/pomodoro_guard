@@ -6,6 +6,8 @@
 模块结构：
 - main_window: 主窗口（UI 布局 + 信号绑定）
 - overlay: 休息全屏遮罩
+- checkpoint_overlay: 检查点确认全屏遮罩
+- restart_overlay: 重启 1 分钟遮罩
 - tray_icon: 系统托盘图标和菜单
 - widgets: 自绘组件（柱状图、统计面板）
 - theme: 主题样式、云母背景、提示音工具
@@ -13,6 +15,8 @@
 
 from gui.main_window import MainWindow, acquire_lock
 from gui.overlay import RestOverlay
+from gui.checkpoint_overlay import CheckpointOverlay
+from gui.restart_overlay import RestartOverlay
 from gui.tray_icon import TrayIcon, make_tray_icon
 from gui.widgets import StatsPanel, BarChart, format_duration
 from gui.theme import (QSS, QSS_MICA, DARK_PHASE_COLORS, play_state_sound,
@@ -20,7 +24,7 @@ from gui.theme import (QSS, QSS_MICA, DARK_PHASE_COLORS, play_state_sound,
 
 __all__ = [
     "MainWindow", "acquire_lock",
-    "RestOverlay",
+    "RestOverlay", "CheckpointOverlay", "RestartOverlay",
     "TrayIcon", "make_tray_icon",
     "StatsPanel", "BarChart", "format_duration",
     "QSS", "QSS_MICA", "DARK_PHASE_COLORS", "play_state_sound",
